@@ -1,0 +1,47 @@
+{% extends "admin/base.html" %}
+{% load static %}
+
+{% block title %}NeuroMed Admin{% endblock %}
+
+{# Add Tailwind (CDN is fine for admin) #}
+{% block extrastyle %}
+  {{ block.super }}
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* keep admin header tidy */
+    .neuromed-brand a { text-decoration: none !important; }
+  </style>
+{% endblock %}
+
+{# Top-left logo/title + top-right action button #}
+{% block branding %}
+  <div class="neuromed-brand w-full flex items-center justify-between gap-4 px-2">
+    <a href="{% url 'admin:index' %}" class="flex items-center gap-3">
+      <span class="inline-flex h-8 w-8 items-center justify-center rounded-xl bg-teal-600 text-white font-semibold">N</span>
+      <span class="text-xl font-semibold">NeuroMed Admin</span>
+    </a>
+
+    <form method="post" action="{% url 'admin:neuromed_tools_call_me' %}" class="m-0">
+      {% csrf_token %}
+      <button
+        type="submit"
+        class="inline-flex items-center gap-2 rounded-xl bg-teal-600 hover:bg-teal-700 text-white px-4 py-2 shadow-sm
+               ring-1 ring-teal-500/30 transition focus:outline-none focus:ring-2 focus:ring-teal-400">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M6.62 10.79a15.05 15.05 0 006.59 6.59l2.2-2.2a1 1 0 011.02-.24 11.36 11.36 0 003.56.57 1 1 0 011 1V20a1 1 0 01-1 1A17 17 0 013 4a1 1 0 011-1h2.49a1 1 0 011 1 11.36 11.36 0 00.57 3.56 1 1 0 01-.24 1.02l-2.2 2.2z"/>
+        </svg>
+        <span>Call my phone (Twilio)</span>
+      </button>
+    </form>
+  </div>
+{% endblock %}
+
+{# Optional: small helper bar under the header #}
+{% block nav-global %}
+  <div class="px-2 py-2 text-sm text-slate-600">
+    Make sure servers are running:
+    <code>python manage.py runserver</code> ·
+    <code>python bot_server.py</code> ·
+    <span class="text-slate-400">WS:</span> <code>{{ request.META.HTTP_HOST }}</code>
+  </div>
+{% endblock %}

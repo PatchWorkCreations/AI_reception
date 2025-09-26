@@ -1,0 +1,10 @@
+version: "3"
+tunnels:
+  django:
+    addr: 8000
+    proto: http
+    metadata: "django server"
+  bot:
+    addr: 8765
+    proto: http
+    metadata: "bot server"
