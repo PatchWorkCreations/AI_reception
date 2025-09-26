@@ -7,11 +7,11 @@ from twilio.rest import Client
 def voice_answer(request):
     twiml = f"""
 <Response>
-  <Connect>
+  <Start>
     <Stream url="{settings.PUBLIC_WS_URL}" track="both_tracks">
       <Parameter name="context" value="neuromed-reception"/>
     </Stream>
-  </Connect>
+  </Start>
 </Response>
 """.strip()
     return HttpResponse(twiml, content_type="text/xml")
