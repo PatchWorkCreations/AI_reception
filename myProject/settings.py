@@ -8,8 +8,9 @@ SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev")
 DEBUG = True
 ALLOWED_HOSTS = os.getenv("DJANGO_ALLOWED_HOSTS", "*").split(",")
 
+# Trust Railway HTTPS origins
 CSRF_TRUSTED_ORIGINS = [
-    "https://*.devtunnels.ms",
+    "https://*.up.railway.app",
 ]
 
 # Application definition
