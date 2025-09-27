@@ -16,11 +16,13 @@ def voice_answer(request):
   <Connect>
     <Stream
       url="{settings.PUBLIC_WS_URL}"
+      track="inbound_audio"
       statusCallback="{settings.PUBLIC_HTTP_ORIGIN}/twilio/status"
       statusCallbackMethod="POST" />
   </Connect>
 </Response>""".strip()
     return HttpResponse(twiml, content_type="text/xml")
+
 
 
 

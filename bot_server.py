@@ -189,6 +189,10 @@ async def handle_twilio(ws):
         "last_reply_ts": 0.0,
     }
 
+    media_stats = {"frames": 0, "bytes": 0}
+    first_media = asyncio.Event()
+
+
     speak_task: asyncio.Task | None = None
 
     stream_sid = None
@@ -273,19 +277,23 @@ async def handle_twilio(ws):
     async def brain():
         if not DEEPGRAM_KEY:
             return
-        last_utter = ""
+
+        # Wait until Twilio actually sends audio so Deepgram won't time out
+        try:
+            await asyncio.wait_for(first_media.wait(), timeout=20.0)
+        except asyncio.TimeoutError:
+            print("ASR ▶ no media within 20s; skipping ASR session")
+            return
+
+        # Consume ASR results and respond
         async for utter in deepgram_stream(pcm_iter):
-            # Heuristic: very short “hm/ah/ok” while bot is talking → ignore
+            # Ignore tiny backchannels while bot is speaking
             if state["speaking"] and len(utter.split()) <= 1:
                 continue
-
-            # If this looks like a finalized sentence (ends with punctuation), send quick ack
-            if utter and utter[-1:] in ".?!":
-                asyncio.create_task(quick_ack())
-
             history.append({"role": "user", "content": utter})
             reply = await llm_reply(history, greeted=state["greeted"])
             await speak(reply)
+
 
 
     brain_task = asyncio.create_task(brain())
@@ -305,15 +313,33 @@ async def handle_twilio(ws):
                     )
 
                 elif ev == "media":
-                    buf = b64_to_bytes(data["media"]["payload"])
+                    payload_b64 = data["media"]["payload"]
+                    buf = b64_to_bytes(payload_b64)
+
+                    # Stats & first-media signal
+                    media_stats["frames"] += 1
+                    media_stats["bytes"]  += len(buf)
+                    if media_stats["frames"] == 1:
+                        first_media.set()
+                        print("WS ▶ first media frame received")
+                    if media_stats["frames"] % 25 == 0:
+                        print(f"WS ▶ media frames={media_stats['frames']} bytes={media_stats['bytes']}")
+
+                    # Feed ASR
                     await inbound_q.put(buf)
 
+                    # Barge-in: cancel any speaking TTS when user talks
                     if state["speaking"] and speak_task and not speak_task.done():
                         speak_task.cancel()
                         try:
                             await speak_task
                         except asyncio.CancelledError:
                             pass
+
+                    # Optional: loopback debug (set ECHO_BACK=1 to hear yourself)
+                    if ECHO_BACK and stream_sid:
+                        await send_pcm(buf)
+
 
 
                 if ECHO_BACK and stream_sid:
