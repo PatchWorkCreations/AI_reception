@@ -312,39 +312,33 @@ async def handle_twilio(ws):
                         speak("Hi! I’m the NeuroMed assistant. What would you like help with today?")
                     )
 
-                elif ev == "media":
-                    payload_b64 = data["media"]["payload"]
-                    buf = b64_to_bytes(payload_b64)
+            elif ev == "media":
+                payload_b64 = data["media"]["payload"]
+                buf = b64_to_bytes(payload_b64)
 
-                    # Stats & first-media signal
-                    media_stats["frames"] += 1
-                    media_stats["bytes"]  += len(buf)
-                    if media_stats["frames"] == 1:
-                        first_media.set()
-                        print("WS ▶ first media frame received")
-                    if media_stats["frames"] % 25 == 0:
-                        print(f"WS ▶ media frames={media_stats['frames']} bytes={media_stats['bytes']}")
+                # Stats & first-media signal
+                media_stats["frames"] += 1
+                media_stats["bytes"]  += len(buf)
+                if media_stats["frames"] == 1:
+                    first_media.set()
+                    print("WS ▶ first media frame received")
+                if media_stats["frames"] % 25 == 0:
+                    print(f"WS ▶ media frames={media_stats['frames']} bytes={media_stats['bytes']}")
 
-                    # Feed ASR
-                    await inbound_q.put(buf)
+                # Feed ASR
+                await inbound_q.put(buf)
 
-                    # Barge-in: cancel any speaking TTS when user talks
-                    if state["speaking"] and speak_task and not speak_task.done():
-                        speak_task.cancel()
-                        try:
-                            await speak_task
-                        except asyncio.CancelledError:
-                            pass
+                # Barge-in: cancel any speaking TTS when user talks
+                if state["speaking"] and speak_task and not speak_task.done():
+                    speak_task.cancel()
+                    try:
+                        await speak_task
+                    except asyncio.CancelledError:
+                        pass
 
-                    # Optional: loopback debug (set ECHO_BACK=1 to hear yourself)
-                    if ECHO_BACK and stream_sid:
-                        await send_pcm(buf)
-
-
-
+                # Optional loopback: only for debugging when ECHO_BACK=1
                 if ECHO_BACK and stream_sid:
                     await send_pcm(buf)
-
 
             elif ev == "stop":
                 print("WS ▶ stop")
@@ -356,6 +350,7 @@ async def handle_twilio(ws):
         await inbound_q.put(None)
         await brain_task
         print("WS ▶ closed")
+
 
 
 async def main():
