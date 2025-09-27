@@ -9,6 +9,10 @@ from django.conf import settings
 from django.http import HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 
+from django.conf import settings
+from django.http import HttpResponse
+from django.views.decorators.csrf import csrf_exempt
+
 @csrf_exempt
 def voice_answer(request):
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -16,7 +20,6 @@ def voice_answer(request):
   <Connect>
     <Stream
       url="{settings.PUBLIC_WS_URL}"
-      track="inbound_audio"
       statusCallback="{settings.PUBLIC_HTTP_ORIGIN}/twilio/status"
       statusCallbackMethod="POST" />
   </Connect>
