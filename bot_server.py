@@ -10,6 +10,7 @@ OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 DEEPGRAM_KEY   = os.getenv("DEEPGRAM_API_KEY")
 ELEVEN_KEY     = os.getenv("ELEVENLABS_API_KEY")
 HTTP_ORIGIN    = os.getenv("PUBLIC_HTTP_ORIGIN", "http://localhost:8000")
+PORT = int(os.getenv("PORT", "8080"))
 
 # Toggle to debug the audio path: 1 = echo caller audio back immediately
 ECHO_BACK      = os.getenv("ECHO_BACK", "0") == "1"
@@ -128,10 +129,16 @@ async def llm_reply(history: list[dict]) -> str:
         return text
 
 # --------- Twilio Media Streams WS server ---------
+# --------- Twilio Media Streams WS server ---------
 async def handle_twilio(ws):
-    print("WS ▶ Twilio connected")
+    # Accept only the expected path (Railway public URL ends with /ws/twilio)
+    if ws.path not in ("/ws/twilio",):
+        await ws.close(code=1008, reason="Unexpected path")
+        return
+
     print("WS ▶ Twilio connected, path:", ws.path)
     print("WS ▶ protocol negotiated:", ws.subprotocol)
+
     inbound_q: asyncio.Queue[bytes] = asyncio.Queue()
     history = [{"role": "system", "content": SYSTEM_PROMPT}]
     stream_sid = None
@@ -155,15 +162,14 @@ async def handle_twilio(ws):
         """TTS via ElevenLabs, streamed back to Twilio."""
         nonlocal stream_sid
         if not stream_sid:
-            # wait until start arrives
             for _ in range(100):
                 await asyncio.sleep(0.01)
-                if stream_sid: break
+                if stream_sid:
+                    break
         async for pcm in eleven_tts_stream(text):
             await send_pcm(pcm)
         print(f"TTS ▶ {text[:60]}...")
 
-    # Start ASR/LLM loop
     async def brain():
         if DEEPGRAM_KEY:
             async for text in deepgram_stream(pcm_iter):
@@ -180,24 +186,17 @@ async def handle_twilio(ws):
             if ev == "start":
                 stream_sid = data.get("start", {}).get("streamSid")
                 print(f"WS ▶ start streamSid={stream_sid}")
-                # Immediate greeting proves outbound audio path
                 asyncio.create_task(
                     speak("Hi, I’m your NeuroMed assistant. How can I help you today?")
                 )
-
             elif ev == "media":
-                # Caller audio in (payload is base64 ulaw_8000)
                 buf = b64_to_bytes(data["media"]["payload"])
                 await inbound_q.put(buf)
-
-                # Echo mode: send caller audio straight back (debug)
                 if ECHO_BACK and stream_sid:
                     await send_pcm(buf)
-
             elif ev == "stop":
                 print("WS ▶ stop")
                 break
-
     except Exception as e:
         print("WS ERR ▶", e)
     finally:
@@ -208,23 +207,23 @@ async def handle_twilio(ws):
 async def main():
     # Quick env prints
     print("ENV ▶ HTTP_ORIGIN =", os.getenv("PUBLIC_HTTP_ORIGIN"))
-    print("ENV ▶ WS URL hint :", os.getenv("PUBLIC_WS_URL"))
+    print("ENV ▶ WS URL hint =", os.getenv("PUBLIC_WS_URL"))
     print("ENV ▶ ELEVEN key? ", "yes" if ELEVEN_KEY else "missing")
     print("ENV ▶ DEEPGRAM?   ", "yes" if DEEPGRAM_KEY else "missing")
     print("ENV ▶ ECHO_BACK   =", ECHO_BACK)
     print("ENV ▶ ELEVEN_VOICE=", ELEVEN_VOICE)
+    print("ENV ▶ PORT        =", PORT)
 
     async with websockets.serve(
-    handle_twilio,
-    "0.0.0.0",
-    8765,
-    max_size=2**20,
-    ping_interval=20,
-    ping_timeout=60,
-    subprotocols=["audio.twilio.com"],  # ← REQUIRED
-):
-
-        print("WS bot listening on ws://0.0.0.0:8765")
+        handle_twilio,
+        "0.0.0.0",
+        PORT,                       # ← bind to Railway-assigned port
+        max_size=2**20,
+        ping_interval=20,
+        ping_timeout=60,
+        subprotocols=["audio.twilio.com"],  # ← REQUIRED by Twilio
+    ):
+        print(f"WS bot listening on ws://0.0.0.0:{PORT}")
         await asyncio.Future()
 
 if __name__ == "__main__":
