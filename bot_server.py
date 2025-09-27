@@ -235,12 +235,20 @@ async def handle_twilio(ws):
     history = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     # Conversation/runtime state
+    # Conversation/runtime state
     state = {
         "greeted": False,
         "speaking": False,
         "last_reply": "",
         "last_reply_ts": 0.0,
+        "barge_in_enabled": False,   # <-- NEW
     }
+
+    async def arm_barge_in_after(seconds: float):
+        await asyncio.sleep(seconds)
+        state["barge_in_enabled"] = True
+        print(f"BARGe-IN ▶ enabled after {seconds:.1f}s")
+
 
     media_stats = {"frames": 0, "bytes": 0}
     first_media = asyncio.Event()
@@ -339,26 +347,44 @@ async def handle_twilio(ws):
         if not DEEPGRAM_KEY:
             return
 
-        # Wait until Twilio actually sends audio so Deepgram won't time out
         try:
             await asyncio.wait_for(first_media.wait(), timeout=20.0)
         except asyncio.TimeoutError:
             print("ASR ▶ no media within 20s; skipping ASR session")
             return
 
-        # Consume ASR results and respond
+        last_user_sent = ""
+
         async for utter in deepgram_stream(pcm_iter):
+            utter = (utter or "").strip()
+            if not utter:
+                continue
+
+            # De-dupe identical partials
+            if utter == last_user_sent:
+                continue
+            last_user_sent = utter
+
             # Ignore tiny backchannels while bot is speaking
             if state["speaking"] and len(utter.split()) <= 1:
                 continue
 
-            # Fire a quick ack for "final-ish" utterances to feel instant
-            if utter and utter[-1:] in ".?!":
+            # BARGe-IN: only if we've armed it
+            if state["barge_in_enabled"] and state["speaking"] and speak_task and not speak_task.done():
+                speak_task.cancel()
+                try:
+                    await speak_task
+                except asyncio.CancelledError:
+                    pass
+
+            if utter[-1:] in ".?!":
                 asyncio.create_task(quick_ack())
 
             history.append({"role": "user", "content": utter})
             reply = await llm_reply(history, greeted=state["greeted"])
             await speak(reply)
+
+
 
 
     brain_task = asyncio.create_task(brain())
@@ -371,39 +397,35 @@ async def handle_twilio(ws):
             if ev == "start":
                 stream_sid = data.get("start", {}).get("streamSid")
                 print(f"WS ▶ start streamSid={stream_sid}")
+                state["barge_in_enabled"] = False            # ensure off at start
                 if not state["greeted"]:
                     state["greeted"] = True
-                    asyncio.create_task(
-                        speak("Hi! I’m the NeuroMed assistant. What would you like help with today?")
-                    )
+                    asyncio.create_task(speak("Hi! I’m the NeuroMed assistant. What would you like help with today?"))
+                    # fallback arming in case first media is late
+                    asyncio.create_task(arm_barge_in_after(1.5))
+
 
             elif ev == "media":
                 payload_b64 = data["media"]["payload"]
                 buf = b64_to_bytes(payload_b64)
 
-                # Stats & first-media signal
                 media_stats["frames"] += 1
                 media_stats["bytes"]  += len(buf)
                 if media_stats["frames"] == 1:
                     first_media.set()
                     print("WS ▶ first media frame received")
+                    # Let greeting start for ~1.2s before allowing interruptions
+                    asyncio.create_task(arm_barge_in_after(1.2))   # <-- NEW
+
                 if media_stats["frames"] % 25 == 0:
                     print(f"WS ▶ media frames={media_stats['frames']} bytes={media_stats['bytes']}")
 
-                # Feed ASR
                 await inbound_q.put(buf)
 
-                # Barge-in: cancel any speaking TTS when user talks
-                if state["speaking"] and speak_task and not speak_task.done():
-                    speak_task.cancel()
-                    try:
-                        await speak_task
-                    except asyncio.CancelledError:
-                        pass
-
-                # Optional loopback: only for debugging when ECHO_BACK=1
                 if ECHO_BACK and stream_sid:
                     await send_pcm(buf)
+
+
 
             elif ev == "stop":
                 print("WS ▶ stop")
