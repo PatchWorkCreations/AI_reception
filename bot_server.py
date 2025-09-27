@@ -53,11 +53,23 @@ async def deepgram_stream(pcm_iter):
 
     async with websockets.connect(url, extra_headers=headers, max_size=2**20) as dg:
         async def feeder():
-            async for chunk in pcm_iter():
-                # Twilio sends 8k μ-law frames; send raw bytes straight to DG
-                await dg.send(chunk)
-            # Politely close DG stream
-            await dg.send(json.dumps({"type": "CloseStream"}))
+            try:
+                async for chunk in pcm_iter():
+                    if chunk is None:
+                        break
+                    try:
+                        await dg.send(chunk)
+                    except websockets.exceptions.ConnectionClosedOK:
+                        break
+                    except websockets.exceptions.ConnectionClosedError:
+                        break
+            finally:
+                # Politely close DG stream, ignore if already closed
+                try:
+                    await dg.send(json.dumps({"type": "CloseStream"}))
+                except Exception:
+                    pass
+
 
         feed_task = asyncio.create_task(feeder())
         buffer = ""
@@ -217,6 +229,64 @@ async def llm_reply(history: list[dict], *, greeted: bool) -> str:
         return out
 
 
+import re
+
+SENTENCE_END = re.compile(r'([.!?…]+)(\s+|$)')
+
+async def stream_llm_sentences(history: list[dict]):
+    """
+    Async generator: yields sentences as the LLM streams tokens.
+    Uses OpenAI Chat Completions streaming via SSE.
+    """
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    }
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": 0.2,
+        "stream": True,
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT}, *history],
+    }
+
+    buf = ""
+    async with httpx.AsyncClient(timeout=None) as client:
+        async with client.stream("POST", url, headers=headers, json=payload) as r:
+            r.raise_for_status()
+            async for line in r.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except Exception:
+                    continue
+                choice = (obj.get("choices") or [{}])[0]
+                delta = (choice.get("delta") or {}).get("content") or ""
+                if not delta:
+                    continue
+                buf += delta
+
+                # Emit complete sentences as soon as they’re ready
+                while True:
+                    m = SENTENCE_END.search(buf)
+                    if not m:
+                        break
+                    end_idx = m.end()
+                    sent = buf[:end_idx].strip()
+                    buf = buf[end_idx:]
+                    if sent:
+                        yield sent
+
+    # Flush any tail text (short last sentence)
+    tail = buf.strip()
+    if tail:
+        yield tail
+
 
 # --------- Twilio Media Streams WS server ---------
 import time
@@ -347,6 +417,7 @@ async def handle_twilio(ws):
         if not DEEPGRAM_KEY:
             return
 
+        # Wait until Twilio actually sends audio so Deepgram won't time out
         try:
             await asyncio.wait_for(first_media.wait(), timeout=20.0)
         except asyncio.TimeoutError:
@@ -369,20 +440,23 @@ async def handle_twilio(ws):
             if state["speaking"] and len(utter.split()) <= 1:
                 continue
 
-            # BARGe-IN: only if we've armed it
-            if state["barge_in_enabled"] and state["speaking"] and speak_task and not speak_task.done():
+            # Barge-in only if armed (we added barge_in_enabled earlier)
+            if state.get("barge_in_enabled") and state["speaking"] and speak_task and not speak_task.done():
                 speak_task.cancel()
                 try:
                     await speak_task
                 except asyncio.CancelledError:
                     pass
 
+            # Fire a quick ack for "final-ish" utterances to feel instant
             if utter[-1:] in ".?!":
                 asyncio.create_task(quick_ack())
 
+            # Update history and stream the LLM reply sentence-by-sentence
             history.append({"role": "user", "content": utter})
-            reply = await llm_reply(history, greeted=state["greeted"])
-            await speak(reply)
+            async for sentence in stream_llm_sentences(history):
+                await speak(sentence)
+
 
 
 
@@ -400,7 +474,7 @@ async def handle_twilio(ws):
                 state["barge_in_enabled"] = False            # ensure off at start
                 if not state["greeted"]:
                     state["greeted"] = True
-                    asyncio.create_task(speak("Hi! I’m the NeuroMed assistant. What would you like help with today?"))
+                    asyncio.create_task(speak("Hi! I’m the NeuroMed assistant. How can I assist you?"))
                     # fallback arming in case first media is late
                     asyncio.create_task(arm_barge_in_after(1.5))
 
