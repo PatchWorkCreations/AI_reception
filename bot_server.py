@@ -32,53 +32,85 @@ def b64_to_bytes(s: str) -> bytes: return base64.b64decode(s)
 def bytes_to_b64(b: bytes) -> str: return base64.b64encode(b).decode()
 
 # --------- Deepgram ASR (ws) ---------
+# --------- Deepgram ASR (ws) ---------
 async def deepgram_stream(pcm_iter):
     if not DEEPGRAM_KEY:
         print("ASR WARN ▶ DEEPGRAM_API_KEY missing; ASR disabled.")
         return
-    url = (
-    "wss://api.deepgram.com/v1/listen"
-    "?model=nova-2"
-    "&encoding=mulaw"
-    "&sample_rate=8000"
-    "&punctuate=true"
-    "&interim_results=true"    # get partials earlier
-    "&vad_events=true"         # get turn-taking faster
-    "&endpointing=true"
-    "&vad_turnoff=300"         # 300ms silence to finalize
-)
 
+    url = (
+        "wss://api.deepgram.com/v1/listen"
+        "?model=nova-2"
+        "&encoding=mulaw"
+        "&sample_rate=8000"
+        "&punctuate=true"
+        "&interim_results=true"
+        "&vad_events=true"
+        "&endpointing=true"
+        "&vad_turnoff=300"
+    )
     headers = [("Authorization", f"Token {DEEPGRAM_KEY}")]
+
     async with websockets.connect(url, extra_headers=headers, max_size=2**20) as dg:
         async def feeder():
             async for chunk in pcm_iter():
+                # Twilio sends 8k μ-law frames; send raw bytes straight to DG
                 await dg.send(chunk)
+            # Politely close DG stream
             await dg.send(json.dumps({"type": "CloseStream"}))
-        feed_task = asyncio.create_task(feeder())
 
+        feed_task = asyncio.create_task(feeder())
         buffer = ""
         last_emit = 0.0
 
         try:
             async for msg in dg:
+                # DG can send text messages for transcripts/events/metadata
                 try:
                     obj = json.loads(msg)
                 except Exception:
                     continue
 
-                # Handle interim/final transcripts
-                alt = (obj.get("channel", {}).get("alternatives") or [{}])[0]
-                txt = (alt.get("transcript") or "").strip()
+                # Skip non-transcript events cleanly
+                if isinstance(obj, dict) and obj.get("type") in {
+                    "Metadata", "Warning", "Error", "Close", "UtteranceEnd",
+                    "SpeechStarted", "SpeechFinished"
+                }:
+                    continue
+
+                # Normalize payload shapes
+                # Possible shapes:
+                #  A) {"channel": {"alternatives": [{"transcript": "...", ...}]}, "is_final": true/false}
+                #  B) {"channel": [ {"alternatives": [...] } ], "is_final": ...}
+                #  C) {"alternatives": [...] }  (rare)
+                alts = []
                 is_final = bool(obj.get("is_final"))
 
+                chan = obj.get("channel")
+                if isinstance(chan, dict):
+                    alts = chan.get("alternatives") or []
+                elif isinstance(chan, list) and chan:
+                    # take first channel entry if list
+                    first_chan = chan[0] or {}
+                    if isinstance(first_chan, dict):
+                        alts = first_chan.get("alternatives") or []
+                elif "alternatives" in obj and isinstance(obj["alternatives"], list):
+                    alts = obj["alternatives"]
+
+                if not alts:
+                    continue
+
+                # First alternative’s transcript
+                txt = (alts[0].get("transcript") or "").strip()
                 if not txt:
                     continue
 
-                # Accumulate partials, throttle emits to ~200ms
+                # Emit partials roughly every 200ms; always emit finals
                 import time
                 buffer = txt
                 now = time.time()
                 if is_final or (now - last_emit) > 0.2:
+                    print(f"ASR ▶ {buffer}")
                     yield buffer
                     last_emit = now
                     if is_final:
@@ -86,29 +118,50 @@ async def deepgram_stream(pcm_iter):
         finally:
             await feed_task
 
+
+# --------- ElevenLabs TTS (ulaw_8000 stream) ---------
 # --------- ElevenLabs TTS (ulaw_8000 stream) ---------
 async def eleven_tts_stream(text: str):
     if not ELEVEN_KEY:
         raise RuntimeError("ELEVENLABS_API_KEY missing.")
+
     url = (
         f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}/stream"
-        "?optimize_streaming_latency=3&output_format=ulaw_8000"
+        "?optimize_streaming_latency=4&output_format=ulaw_8000"
     )
-    headers = {"xi-api-key": ELEVEN_KEY, "Content-Type": "application/json"}
-    payload = {"text": text, "voice_settings": {"stability": 0.5, "similarity_boost": 0.8}}
+    headers = {
+        "xi-api-key": ELEVEN_KEY,
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+    }
+    payload = {
+        "text": text,
+        "model_id": "eleven_multilingual_v2",     # explicit model = fewer surprises
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.8},
+    }
+
     async with httpx.AsyncClient(timeout=None) as client:
         try:
             async with client.stream("POST", url, headers=headers, json=payload) as r:
-                r.raise_for_status()
+                if r.is_error:
+                    body = await r.aread()  # <-- must read body on streaming responses
+                    print("ELEVENLABS HTTP ERROR ▶", r.status_code, body[:200])
+                    return
                 async for chunk in r.aiter_bytes():
                     if chunk:
                         yield chunk
         except httpx.HTTPStatusError as e:
-            print("ELEVENLABS HTTP ERROR ▶", e.response.status_code, e.response.text[:200])
-            raise
+            body = b""
+            try:
+                body = await e.response.aread()
+            except Exception:
+                pass
+            print("ELEVENLABS EXC ▶", getattr(e.response, "status_code", "?"), body[:200])
+            return
         except Exception as e:
-            print("ELEVENLABS ERROR ▶", e)
-            raise
+            print("ELEVENLABS ERROR ▶", repr(e))
+            return
+
 
 # --------- Simple tool call to your Django FAQ ---------
 async def call_faq(q: str) -> str:
@@ -231,7 +284,11 @@ async def handle_twilio(ws):
         nonlocal stream_sid, speak_task
         import time
 
-        # Wait for Twilio to send 'start' so we have a streamSid
+        text = (text or "").strip()
+        if not text:
+            return
+
+        # Wait for Twilio 'start' so we have a streamSid
         if not stream_sid:
             for _ in range(100):
                 await asyncio.sleep(0.01)
@@ -240,7 +297,7 @@ async def handle_twilio(ws):
 
         # De-dupe: avoid repeating the same line within 2.5s
         now = time.time()
-        if text.strip() == state["last_reply"].strip() and (now - state["last_reply_ts"]) < 2.5:
+        if text == state["last_reply"].strip() and (now - state["last_reply_ts"]) < 2.5:
             print("TTS ▶ duplicate suppressed")
             return
 
@@ -255,11 +312,13 @@ async def handle_twilio(ws):
         async def _run():
             state["speaking"] = True
             any_chunk = False
+            cancelled = False
             try:
                 async for pcm in eleven_tts_stream(text):
                     any_chunk = True
                     await send_pcm(pcm)
             except asyncio.CancelledError:
+                cancelled = True
                 print("TTS ▶ canceled (barge-in)")
                 raise
             finally:
@@ -269,9 +328,11 @@ async def handle_twilio(ws):
                     state["last_reply_ts"] = time.time()
                     print(f"TTS ▶ {text[:60]}...")
                 else:
-                    print("TTS ▶ no audio produced (check TTS provider)")
+                    if not cancelled:
+                        print("TTS ▶ no audio produced (check TTS provider)")
 
         speak_task = asyncio.create_task(_run())
+
 
 
     async def brain():
@@ -290,10 +351,14 @@ async def handle_twilio(ws):
             # Ignore tiny backchannels while bot is speaking
             if state["speaking"] and len(utter.split()) <= 1:
                 continue
+
+            # Fire a quick ack for "final-ish" utterances to feel instant
+            if utter and utter[-1:] in ".?!":
+                asyncio.create_task(quick_ack())
+
             history.append({"role": "user", "content": utter})
             reply = await llm_reply(history, greeted=state["greeted"])
             await speak(reply)
-
 
 
     brain_task = asyncio.create_task(brain())
