@@ -19,14 +19,43 @@ ELEVEN_VOICE   = os.getenv("ELEVENLABS_VOICE_ID", "Bella")
 
 SYSTEM_PROMPT = """
 You are the NeuroMed AI receptionist. Be warm, clear, concise, and human-sounding.
-Goals:
-- Greet and assist. If asked “what is NeuroMed AI”, give a succinct ~30–60s explanation.
-- Answer FAQs: HIPAA/privacy, cost (pilot-based), pilots (3–6 months), faith-aware mode, hours/address.
-Rules:
-- Keep replies to 1–2 sentences unless doing the explanation.
-- Never give medical advice or promise unlisted features.
-- Speak in American English.
+Mission:
+- NeuroMed AI helps families, caregivers, and clinics by turning medical files (discharge notes, labs, imaging) into plain-language summaries, with optional styles: plain, caregiver-friendly, faith + encouragement, or clinical.
+
+Guardrails:
+- Do not give medical advice or diagnose. Never promise unlisted features. Avoid speculative claims.
+- Privacy: reassure that data is kept private; do not discuss implementation details unless asked.
+- If asked for pricing/partners/pilots, acknowledge tiers/pilots and offer email follow-up rather than quoting numbers.
+- If the user wants next steps, politely collect name + email.
+
+Style:
+- Sound human and warm. 1–2 sentences by default; longer only for the “what is NeuroMed AI” explanation (~30–60s).
+- Use light natural pacing (brief pauses are added by the audio layer). Avoid filler endings like “feel free to ask more questions.”
+- If the user greets or backchannels (“okay”, “yeah”), acknowledge briefly and continue.
+- If the user is unclear, ask a short clarifying question.
+
+Output Rules:
+- Stay on purpose: clarity, comfort, compassion. Use American English only (no code-switching).
+- Never end with generic closers (“feel free to ask”, “how can I assist further?”) unless explicitly requested.
 """
+
+# Few-shots to teach tone (not scripts)
+FEWSHOTS = [
+    {"role": "user", "content": "Can you tell me more about miramad ai?"},
+    {"role": "assistant", "content": "NeuroMed AI turns medical files—like discharge notes, labs, or images—into clear summaries you can choose the tone for (plain, caregiver-friendly, faith + encouragement, or clinical). It’s built to support families, caregivers, and clinics with clarity and compassion."},
+
+    {"role": "user", "content": "is this hipaa compliant? how private is it"},
+    {"role": "assistant", "content": "Your files are kept private and secure, and we don’t share your data with anyone. If you’d like, I can send a brief summary of our privacy approach to your email."},
+
+    {"role": "user", "content": "how much does it cost"},
+    {"role": "assistant", "content": "We offer options for families, caregivers, and facilities. I can email you a quick overview so you can pick what fits best—what’s the best email to use?"},
+
+    {"role": "user", "content": "do you have a faith based option?"},
+    {"role": "assistant", "content": "Yes—there’s a mode with encouragement and Scripture for callers who want hope alongside clarity."},
+
+    {"role": "user", "content": "ok, how do we start?"},
+    {"role": "assistant", "content": "Great—can I have your name and best email? We’ll send next steps and a short demo."},
+]
 
 # --------- helpers ---------
 def b64_to_bytes(s: str) -> bytes:
@@ -184,15 +213,10 @@ async def call_faq(q: str) -> str:
         r.raise_for_status()
         return r.json().get("answer", "")
 
-def is_greeting(s: str) -> bool:
-    s = s.strip().lower().replace("?", "")
-    short = {"hi", "hello", "hey", "yo", "good morning", "good afternoon", "good evening"}
-    return s in short
-
 def looks_like_what_is_neuromed(s: str) -> bool:
     q = re.sub(r"[^a-z0-9 ]+", " ", s.lower())
     if ("what is" in q) or ("what s" in q) or ("what's" in q):
-        # catch misspellings / variants
+        # catch common misspellings / variants
         keywords = ["neuromed", "neuro med", "miura", "miramad", "mira med", "your med ai", "neuro ai", "med ai"]
         return any(k in q for k in keywords)
     return False
@@ -200,7 +224,7 @@ def looks_like_what_is_neuromed(s: str) -> bool:
 # --------- Streaming LLM sentences via SSE ---------
 SENTENCE_END = re.compile(r'([.!?…]+)(\s+|$)')
 
-async def stream_llm_sentences(history: list[dict]):
+async def stream_llm_sentences(messages: list[dict]):
     """
     Async generator: yields sentences as the LLM streams tokens (SSE).
     """
@@ -214,7 +238,7 @@ async def stream_llm_sentences(history: list[dict]):
         "model": OPENAI_MODEL,
         "temperature": 0.2,
         "stream": True,
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}, *history],
+        "messages": messages,
     }
 
     buf = ""
@@ -251,6 +275,102 @@ async def stream_llm_sentences(history: list[dict]):
     if tail:
         yield tail
 
+# --------- Intent & slot extraction ---------
+INTENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "intent": {"type": "string", "enum": [
+            "greeting","what_is","hipaa","pricing","faith_mode","pilot","hours",
+            "address","schedule_contact","smalltalk","other"
+        ]},
+        "name":   {"type":"string"},
+        "email":  {"type":"string"},
+        "org":    {"type":"string"},
+        "notes":  {"type":"string"}
+    },
+    "required": ["intent"]
+}
+
+async def extract_intent_slots(utterance: str) -> dict:
+    prompt = {
+        "role":"system",
+        "content": "Extract the user's intent and any available contact info. Respond with pure JSON only."
+    }
+    user = {"role":"user","content": utterance}
+    async with httpx.AsyncClient(timeout=None) as client:
+        r = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json={
+                "model": OPENAI_MODEL,
+                "temperature": 0.0,
+                "response_format": {
+                    "type":"json_schema",
+                    "json_schema":{"name":"intent","schema":INTENT_SCHEMA,"strict":True}
+                },
+                "messages": [prompt, user]
+            }
+        )
+        r.raise_for_status()
+        data = r.json()["choices"][0]["message"]["content"]
+        try:
+            return json.loads(data)
+        except Exception:
+            return {"intent":"other"}
+
+# --------- Planner (what to say) ---------
+WEAK_CLOSERS = {
+  "if you have more questions, feel free to ask.",
+  "if you have any questions, feel free to ask.",
+  "if you have any specific questions or need assistance, feel free to ask.",
+  "let me know if you have other questions.",
+  "how can i assist you further?",
+  "feel free to ask!",
+  "feel free to ask more questions.",
+}
+
+def should_skip_sentence(s: str) -> bool:
+    return (s or "").strip().lower() in WEAK_CLOSERS
+
+async def plan_reply(history: list[dict]) -> list[str]:
+    """Return a list of sentences to speak. Empty list => use generative streaming."""
+    last = (history[-1]["content"] if history else "").strip()
+    slots = await extract_intent_slots(last)
+    intent = slots.get("intent","other")
+
+    if intent == "greeting":
+        return ["Hi! What would you like help with today—overview, pricing, or getting started?"]
+    if intent == "hipaa":
+        return ["Your files are kept private and secure, and we don’t share your data with anyone."]
+    if intent == "pricing":
+        return ["We offer options for families, caregivers, and facilities. I can send a quick overview—what’s the best email to use?"]
+    if intent == "faith_mode":
+        return ["Yes—there’s a mode with encouragement and Scripture for those who want hope alongside clarity."]
+    if intent == "pilot":
+        return ["We do pilot programs with nursing homes, clinics, and community groups. I can email details—what email should we use?"]
+    if intent == "hours":
+        return ["We’re available weekdays; if you share your time zone, I can suggest a slot."]
+    if intent == "address":
+        return ["We operate online and partner with facilities; if you share your city, I can route you."]
+
+    if intent == "what_is":
+        text = (
+          "NeuroMed AI turns medical files like discharge notes, labs, and imaging into plain-language summaries. "
+          "You can choose the tone—plain, caregiver-friendly, faith + encouragement, or clinical—so it meets the moment. "
+          "It’s built to help families, caregivers, and clinics find clarity quickly without medical advice."
+        )
+        return [s for s in re.split(r'(?<=[.!?])\s+', text) if s and not should_skip_sentence(s)]
+
+    if intent == "schedule_contact":
+        name = slots.get("name")
+        email = slots.get("email")
+        if name and email:
+            return [f"Thanks, {name}. We’ll email next steps to {email} shortly."]
+        return ["Great—could I have your name and best email so we can send next steps?"]
+
+    # Fallback to generative (use FEWSHOTS + SYSTEM_PROMPT)
+    return []
+
 # --------- Twilio Media Streams WS server ---------
 async def handle_twilio(ws):
     # Accept only the expected path
@@ -270,7 +390,8 @@ async def handle_twilio(ws):
         "speaking": False,
         "last_reply": "",
         "last_reply_ts": 0.0,
-        "barge_in_enabled": False,   # armed after greeting
+        "barge_in_enabled": False,   # armed after greeting grace
+        "long_answer_until": 0.0,    # grace window while bot is explaining
     }
 
     async def arm_barge_in_after(seconds: float):
@@ -396,8 +517,16 @@ async def handle_twilio(ws):
             if state["speaking"] and len(utter.split()) <= 1:
                 continue
 
-            # Barge-in only on finals or longer partials (≥4 words) and only if armed
-            should_barge = is_final or (len(utter.split()) >= 4)
+            # Decide whether to barge: finals >=3 words; partials >=6 words
+            # Stricter while in long-answer window (finals >=5 words; partials >=8)
+            words = utter.split()
+            now = time.time()
+            in_long_window = now < state["long_answer_until"]
+
+            barge_on_final = is_final and len(words) >= (5 if in_long_window else 3)
+            barge_on_partial = (not is_final) and len(words) >= (8 if in_long_window else 6)
+            should_barge = (barge_on_final or barge_on_partial)
+
             if should_barge and state.get("barge_in_enabled") and state["speaking"] and speak_task and not speak_task.done():
                 speak_task.cancel()
                 try:
@@ -405,26 +534,36 @@ async def handle_twilio(ws):
                 except asyncio.CancelledError:
                     pass
 
-            # Route "what is neuromed" style queries (with typos) to FAQ, sentence-by-sentence
+            # Route "what is neuromed" style queries (with typos) to FAQ
             if is_final and looks_like_what_is_neuromed(utter):
                 if not state["speaking"]:
                     asyncio.create_task(speak("Sure—"))
                 answer = await call_faq("what_is_neuromed")
+                state["long_answer_until"] = time.time() + 2.0
                 for sentence in re.split(r'(?<=[.!?])\s+', (answer or "").strip()):
-                    if sentence:
+                    if sentence and not should_skip_sentence(sentence):
                         await speak(sentence)
                 continue
 
-            # Friendly quick-ack on finals (if not currently speaking)
-            if is_final and not state["speaking"]:
-                asyncio.create_task(speak(random.choice(QUICK_ACKS)))
-
-            # Normal streaming: update history and stream LLM sentences (only on finals)
+            # Normal: update history
             history.append({"role": "user", "content": utter})
+
+            # Only act on final turns (partials accumulate)
             if is_final:
-                async for sentence in stream_llm_sentences(history):
-                    await speak(sentence)
-            # If partial: do nothing (let it accumulate)
+                # Grace window while we speak the reply
+                state["long_answer_until"] = time.time() + 2.0
+
+                plan = await plan_reply(history)
+                if plan:
+                    for sentence in plan:
+                        await speak(sentence)
+                else:
+                    # No plan => stream generative with SYSTEM + FEWSHOTS + history
+                    gen_messages = [{"role":"system","content": SYSTEM_PROMPT}, *FEWSHOTS, *history]
+                    async for sentence in stream_llm_sentences(gen_messages):
+                        if should_skip_sentence(sentence):
+                            continue
+                        await speak(sentence)
 
     brain_task = asyncio.create_task(brain())
 
