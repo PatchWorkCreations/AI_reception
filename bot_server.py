@@ -1,4 +1,4 @@
-import os, json, base64, asyncio, websockets, httpx
+import os, json, base64, asyncio, websockets, httpx, re, time, random
 from dotenv import load_dotenv
 
 # Load envs next to this file (same folder as manage.py)
@@ -10,7 +10,7 @@ OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 DEEPGRAM_KEY   = os.getenv("DEEPGRAM_API_KEY")
 ELEVEN_KEY     = os.getenv("ELEVENLABS_API_KEY")
 HTTP_ORIGIN    = os.getenv("PUBLIC_HTTP_ORIGIN", "http://localhost:8000")
-PORT = int(os.getenv("PORT", "8080"))
+PORT           = int(os.getenv("PORT", "8080"))
 
 # Toggle to debug the audio path: 1 = echo caller audio back immediately
 ECHO_BACK      = os.getenv("ECHO_BACK", "0") == "1"
@@ -18,20 +18,32 @@ ECHO_BACK      = os.getenv("ECHO_BACK", "0") == "1"
 ELEVEN_VOICE   = os.getenv("ELEVENLABS_VOICE_ID", "Bella")
 
 SYSTEM_PROMPT = """
-You are the NeuroMed AI receptionist. Be warm, clear, concise, and compassionate (Taglish allowed).
+You are the NeuroMed AI receptionist. Be warm, clear, concise, and human-sounding.
 Goals:
-- Greet and assist. If asked “what is NeuroMed AI”, give a succinct ~30-60s explanation.
+- Greet and assist. If asked “what is NeuroMed AI”, give a succinct ~30–60s explanation.
 - Answer FAQs: HIPAA/privacy, cost (pilot-based), pilots (3–6 months), faith-aware mode, hours/address.
 Rules:
 - Keep replies to 1–2 sentences unless doing the explanation.
 - Never give medical advice or promise unlisted features.
+- Speak in American English.
 """
 
 # --------- helpers ---------
-def b64_to_bytes(s: str) -> bytes: return base64.b64decode(s)
-def bytes_to_b64(b: bytes) -> str: return base64.b64encode(b).decode()
+def b64_to_bytes(s: str) -> bytes:
+    return base64.b64decode(s)
 
-# --------- Deepgram ASR (ws) ---------
+def bytes_to_b64(b: bytes) -> str:
+    return base64.b64encode(b).decode()
+
+# ---- pacing helpers (μ-law silence @ 8 kHz) ----
+def _ulaw_silence(ms: int) -> bytes:
+    # μ-law "silence" byte is 0xFF for zero amplitude; 8 samples/ms at 8kHz
+    return b"\xff" * int(8 * ms)
+
+async def send_silence(ws_send_pcm, ms: int):
+    if ms > 0:
+        await ws_send_pcm(_ulaw_silence(ms))
+
 # --------- Deepgram ASR (ws) ---------
 async def deepgram_stream(pcm_iter):
     if not DEEPGRAM_KEY:
@@ -59,9 +71,8 @@ async def deepgram_stream(pcm_iter):
                         break
                     try:
                         await dg.send(chunk)
-                    except websockets.exceptions.ConnectionClosedOK:
-                        break
-                    except websockets.exceptions.ConnectionClosedError:
+                    except (websockets.exceptions.ConnectionClosedOK,
+                            websockets.exceptions.ConnectionClosedError):
                         break
             finally:
                 # Politely close DG stream, ignore if already closed
@@ -70,39 +81,32 @@ async def deepgram_stream(pcm_iter):
                 except Exception:
                     pass
 
-
         feed_task = asyncio.create_task(feeder())
-        buffer = ""
+
+        last_sent = ""
         last_emit = 0.0
 
         try:
             async for msg in dg:
-                # DG can send text messages for transcripts/events/metadata
                 try:
                     obj = json.loads(msg)
                 except Exception:
                     continue
 
-                # Skip non-transcript events cleanly
+                # Ignore non-transcript events
                 if isinstance(obj, dict) and obj.get("type") in {
-                    "Metadata", "Warning", "Error", "Close", "UtteranceEnd",
-                    "SpeechStarted", "SpeechFinished"
+                    "Metadata","Warning","Error","Close","UtteranceEnd",
+                    "SpeechStarted","SpeechFinished"
                 }:
                     continue
 
-                # Normalize payload shapes
-                # Possible shapes:
-                #  A) {"channel": {"alternatives": [{"transcript": "...", ...}]}, "is_final": true/false}
-                #  B) {"channel": [ {"alternatives": [...] } ], "is_final": ...}
-                #  C) {"alternatives": [...] }  (rare)
+                # Normalize shapes: dict or list channel, or top-level alternatives
                 alts = []
                 is_final = bool(obj.get("is_final"))
-
                 chan = obj.get("channel")
                 if isinstance(chan, dict):
                     alts = chan.get("alternatives") or []
                 elif isinstance(chan, list) and chan:
-                    # take first channel entry if list
                     first_chan = chan[0] or {}
                     if isinstance(first_chan, dict):
                         alts = first_chan.get("alternatives") or []
@@ -112,26 +116,25 @@ async def deepgram_stream(pcm_iter):
                 if not alts:
                     continue
 
-                # First alternative’s transcript
                 txt = (alts[0].get("transcript") or "").strip()
                 if not txt:
                     continue
 
-                # Emit partials roughly every 200ms; always emit finals
-                import time
-                buffer = txt
+                # Throttle partials; always emit finals; skip unchanged partials
                 now = time.time()
-                if is_final or (now - last_emit) > 0.2:
-                    print(f"ASR ▶ {buffer}")
-                    yield buffer
-                    last_emit = now
-                    if is_final:
-                        buffer = ""
+                should_emit = is_final or (now - last_emit) > 0.2
+                if not should_emit:
+                    continue
+                if not is_final and txt == last_sent:
+                    continue
+
+                print(f"ASR{'(final)' if is_final else ''} ▶ {txt}")
+                yield txt, is_final
+                last_emit = now
+                last_sent = txt
         finally:
             await feed_task
 
-
-# --------- ElevenLabs TTS (ulaw_8000 stream) ---------
 # --------- ElevenLabs TTS (ulaw_8000 stream) ---------
 async def eleven_tts_stream(text: str):
     if not ELEVEN_KEY:
@@ -148,7 +151,7 @@ async def eleven_tts_stream(text: str):
     }
     payload = {
         "text": text,
-        "model_id": "eleven_multilingual_v2",     # explicit model = fewer surprises
+        "model_id": "eleven_multilingual_v2",
         "voice_settings": {"stability": 0.5, "similarity_boost": 0.8},
     }
 
@@ -156,7 +159,7 @@ async def eleven_tts_stream(text: str):
         try:
             async with client.stream("POST", url, headers=headers, json=payload) as r:
                 if r.is_error:
-                    body = await r.aread()  # <-- must read body on streaming responses
+                    body = await r.aread()  # must read body on streaming responses
                     print("ELEVENLABS HTTP ERROR ▶", r.status_code, body[:200])
                     return
                 async for chunk in r.aiter_bytes():
@@ -174,69 +177,32 @@ async def eleven_tts_stream(text: str):
             print("ELEVENLABS ERROR ▶", repr(e))
             return
 
-
 # --------- Simple tool call to your Django FAQ ---------
 async def call_faq(q: str) -> str:
     async with httpx.AsyncClient() as client:
         r = await client.get(f"{HTTP_ORIGIN}/api/faq", params={"q": q})
         r.raise_for_status()
         return r.json().get("answer", "")
-    
+
 def is_greeting(s: str) -> bool:
-    s = s.strip().lower()
+    s = s.strip().lower().replace("?", "")
     short = {"hi", "hello", "hey", "yo", "good morning", "good afternoon", "good evening"}
-    s = s.replace("?", "")
     return s in short
 
+def looks_like_what_is_neuromed(s: str) -> bool:
+    q = re.sub(r"[^a-z0-9 ]+", " ", s.lower())
+    if ("what is" in q) or ("what s" in q) or ("what's" in q):
+        # catch misspellings / variants
+        keywords = ["neuromed", "neuro med", "miura", "miramad", "mira med", "your med ai", "neuro ai", "med ai"]
+        return any(k in q for k in keywords)
+    return False
 
-async def llm_reply(history: list[dict], *, greeted: bool) -> str:
-    last = history[-1]["content"].strip()
-    low  = last.lower()
-
-    if is_greeting(low):
-        return "Hi! What would you like help with—appointments, pricing, or a quick overview of NeuroMed?"
-
-    if any(k in low for k in ["hipaa","privacy","secure","security","phi","compliant","compliance","confidential"]):
-        return await call_faq("hipaa")
-    if any(k in low for k in ["price","pricing","cost","how much"]):
-        return await call_faq("pricing")
-    if "pilot" in low or "test" in low or "trial" in low:
-        return await call_faq("pilot")
-    if "faith" in low:
-        return await call_faq("faith")
-    if "what is neuromed" in low or ("what" in low and "neuromed" in low):
-        return await call_faq("what_is_neuromed")
-    if any(k in low for k in ["hour","open","schedule availability","hours"]):
-        return await call_faq("hours")
-    if any(k in low for k in ["address","location","where"]):
-        return await call_faq("address")
-
-    async with httpx.AsyncClient(timeout=None) as client:
-        r = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            json={
-                "model": OPENAI_MODEL,
-                "temperature": 0.2,
-                "messages": [{"role": "system", "content": SYSTEM_PROMPT}, *history],
-            },
-        )
-        r.raise_for_status()
-        out = r.json()["choices"][0]["message"]["content"].strip()
-        if not out.endswith("?") and len(out.split()) < 36:
-            out += " How can I help further?"
-        print(f"LLM ▶ {out[:80]}...")
-        return out
-
-
-import re
-
+# --------- Streaming LLM sentences via SSE ---------
 SENTENCE_END = re.compile(r'([.!?…]+)(\s+|$)')
 
 async def stream_llm_sentences(history: list[dict]):
     """
-    Async generator: yields sentences as the LLM streams tokens.
-    Uses OpenAI Chat Completions streaming via SSE.
+    Async generator: yields sentences as the LLM streams tokens (SSE).
     """
     url = "https://api.openai.com/v1/chat/completions"
     headers = {
@@ -265,8 +231,7 @@ async def stream_llm_sentences(history: list[dict]):
                     obj = json.loads(data)
                 except Exception:
                     continue
-                choice = (obj.get("choices") or [{}])[0]
-                delta = (choice.get("delta") or {}).get("content") or ""
+                delta = ((obj.get("choices") or [{}])[0].get("delta") or {}).get("content") or ""
                 if not delta:
                     continue
                 buf += delta
@@ -281,22 +246,17 @@ async def stream_llm_sentences(history: list[dict]):
                     buf = buf[end_idx:]
                     if sent:
                         yield sent
-
     # Flush any tail text (short last sentence)
     tail = buf.strip()
     if tail:
         yield tail
 
-
 # --------- Twilio Media Streams WS server ---------
-import time
-
 async def handle_twilio(ws):
     # Accept only the expected path
     if ws.path not in ("/ws/twilio",):
         await ws.close(code=1008, reason="Unexpected path")
         return
-    
 
     print("WS ▶ Twilio connected, path:", ws.path)
     print("WS ▶ protocol negotiated:", ws.subprotocol)
@@ -305,13 +265,12 @@ async def handle_twilio(ws):
     history = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     # Conversation/runtime state
-    # Conversation/runtime state
     state = {
         "greeted": False,
         "speaking": False,
         "last_reply": "",
         "last_reply_ts": 0.0,
-        "barge_in_enabled": False,   # <-- NEW
+        "barge_in_enabled": False,   # armed after greeting
     }
 
     async def arm_barge_in_after(seconds: float):
@@ -319,24 +278,17 @@ async def handle_twilio(ws):
         state["barge_in_enabled"] = True
         print(f"BARGe-IN ▶ enabled after {seconds:.1f}s")
 
-
     media_stats = {"frames": 0, "bytes": 0}
     first_media = asyncio.Event()
 
-
     speak_task: asyncio.Task | None = None
-
     stream_sid = None
 
-    QUICK_ACKS = [
-    "Sige.", "Got it.", "Okay.", "Noted.", "Sure.", "Sige po."
-    ]
-    import random
+    QUICK_ACKS = ["Okay.", "Got it.", "Sure.", "Alright.", "Understood.", "One moment."]
 
     async def quick_ack():
         if not state["speaking"]:
             await speak(random.choice(QUICK_ACKS))
-
 
     async def pcm_iter():
         while True:
@@ -357,10 +309,9 @@ async def handle_twilio(ws):
         Cancelable TTS via ElevenLabs, streamed back to Twilio.
         - Cancels any in-flight TTS (barge-in)
         - Suppresses duplicate replies within 2.5s
-        - Updates state.last_reply / timestamps on success
+        - Adds small pre/post silences for natural pacing
         """
         nonlocal stream_sid, speak_task
-        import time
 
         text = (text or "").strip()
         if not text:
@@ -379,7 +330,7 @@ async def handle_twilio(ws):
             print("TTS ▶ duplicate suppressed")
             return
 
-        # If a previous TTS is still speaking, cancel it (barge-in)
+        # If previous TTS is still speaking, cancel it (barge-in)
         if speak_task and not speak_task.done():
             speak_task.cancel()
             try:
@@ -392,9 +343,16 @@ async def handle_twilio(ws):
             any_chunk = False
             cancelled = False
             try:
+                # Pre-breath (120 ms)
+                await send_silence(send_pcm, 120)
+
                 async for pcm in eleven_tts_stream(text):
                     any_chunk = True
                     await send_pcm(pcm)
+
+                # Post-pause (80 ms)
+                await send_silence(send_pcm, 80)
+
             except asyncio.CancelledError:
                 cancelled = True
                 print("TTS ▶ canceled (barge-in)")
@@ -411,8 +369,6 @@ async def handle_twilio(ws):
 
         speak_task = asyncio.create_task(_run())
 
-
-
     async def brain():
         if not DEEPGRAM_KEY:
             return
@@ -426,12 +382,12 @@ async def handle_twilio(ws):
 
         last_user_sent = ""
 
-        async for utter in deepgram_stream(pcm_iter):
+        async for utter, is_final in deepgram_stream(pcm_iter):
             utter = (utter or "").strip()
             if not utter:
                 continue
 
-            # De-dupe identical partials
+            # De-dupe identical emissions
             if utter == last_user_sent:
                 continue
             last_user_sent = utter
@@ -440,26 +396,35 @@ async def handle_twilio(ws):
             if state["speaking"] and len(utter.split()) <= 1:
                 continue
 
-            # Barge-in only if armed (we added barge_in_enabled earlier)
-            if state.get("barge_in_enabled") and state["speaking"] and speak_task and not speak_task.done():
+            # Barge-in only on finals or longer partials (≥4 words) and only if armed
+            should_barge = is_final or (len(utter.split()) >= 4)
+            if should_barge and state.get("barge_in_enabled") and state["speaking"] and speak_task and not speak_task.done():
                 speak_task.cancel()
                 try:
                     await speak_task
                 except asyncio.CancelledError:
                     pass
 
-            # Fire a quick ack for "final-ish" utterances to feel instant
-            if utter[-1:] in ".?!":
-                asyncio.create_task(quick_ack())
+            # Route "what is neuromed" style queries (with typos) to FAQ, sentence-by-sentence
+            if is_final and looks_like_what_is_neuromed(utter):
+                if not state["speaking"]:
+                    asyncio.create_task(speak("Sure—"))
+                answer = await call_faq("what_is_neuromed")
+                for sentence in re.split(r'(?<=[.!?])\s+', (answer or "").strip()):
+                    if sentence:
+                        await speak(sentence)
+                continue
 
-            # Update history and stream the LLM reply sentence-by-sentence
+            # Friendly quick-ack on finals (if not currently speaking)
+            if is_final and not state["speaking"]:
+                asyncio.create_task(speak(random.choice(QUICK_ACKS)))
+
+            # Normal streaming: update history and stream LLM sentences (only on finals)
             history.append({"role": "user", "content": utter})
-            async for sentence in stream_llm_sentences(history):
-                await speak(sentence)
-
-
-
-
+            if is_final:
+                async for sentence in stream_llm_sentences(history):
+                    await speak(sentence)
+            # If partial: do nothing (let it accumulate)
 
     brain_task = asyncio.create_task(brain())
 
@@ -471,13 +436,14 @@ async def handle_twilio(ws):
             if ev == "start":
                 stream_sid = data.get("start", {}).get("streamSid")
                 print(f"WS ▶ start streamSid={stream_sid}")
-                state["barge_in_enabled"] = False            # ensure off at start
+                state["barge_in_enabled"] = False  # ensure off at start
                 if not state["greeted"]:
                     state["greeted"] = True
-                    asyncio.create_task(speak("Hi! I’m the NeuroMed assistant. How can I assist you?"))
+                    asyncio.create_task(
+                        speak("Hi! I’m the NeuroMed assistant. What do you need today—pricing, hours, or a quick overview?")
+                    )
                     # fallback arming in case first media is late
                     asyncio.create_task(arm_barge_in_after(1.5))
-
 
             elif ev == "media":
                 payload_b64 = data["media"]["payload"]
@@ -489,17 +455,16 @@ async def handle_twilio(ws):
                     first_media.set()
                     print("WS ▶ first media frame received")
                     # Let greeting start for ~1.2s before allowing interruptions
-                    asyncio.create_task(arm_barge_in_after(1.2))   # <-- NEW
+                    asyncio.create_task(arm_barge_in_after(1.2))
 
                 if media_stats["frames"] % 25 == 0:
                     print(f"WS ▶ media frames={media_stats['frames']} bytes={media_stats['bytes']}")
 
                 await inbound_q.put(buf)
 
+                # Optional loopback: only for debugging when ECHO_BACK=1
                 if ECHO_BACK and stream_sid:
                     await send_pcm(buf)
-
-
 
             elif ev == "stop":
                 print("WS ▶ stop")
@@ -511,8 +476,6 @@ async def handle_twilio(ws):
         await inbound_q.put(None)
         await brain_task
         print("WS ▶ closed")
-
-
 
 async def main():
     # Quick env prints
