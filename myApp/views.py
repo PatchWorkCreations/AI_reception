@@ -15,46 +15,17 @@ from django.views.decorators.csrf import csrf_exempt
 
 @csrf_exempt
 def voice_answer(request):
-    # Pull helpful context from Twilio's webhook request
-    call_sid = request.POST.get("CallSid", "") or request.GET.get("CallSid", "")
-    from_num = request.POST.get("From", "") or request.GET.get("From", "")
-    to_num   = request.POST.get("To", "") or request.GET.get("To", "")
-
-    # Make sure the WS URL has the right path
-    base_ws = (getattr(settings, "PUBLIC_WS_URL", "") or "").strip()
-    if base_ws and not base_ws.endswith("/ws/twilio"):
-        # allow both ".../ws" and bare host to resolve correctly
-        if base_ws.endswith("/ws"):
-            base_ws = f"{base_ws}/twilio"
-        else:
-            base_ws = f"{base_ws.rstrip('/')}/ws/twilio"
-
-    public_http = (getattr(settings, "PUBLIC_HTTP_ORIGIN", "") or "").strip()
-    status_cb   = f"{public_http.rstrip('/')}/twilio/status" if public_http else ""
-
-    # Build TwiML
-    # - track="inbound_audio" ensures a single stream of caller audio only
-    # - name is optional, but handy for logs
-    # - custom <Parameter> values show up in the WebSocket `start` event as customParameters.*
-    # - statusCallbackEvent controls which events Twilio POSTs back (start/mark/stop are the useful ones)
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream
-      url="{base_ws}"
-      track="inbound_audio"
-      name="neuromed-stream"
-      statusCallback="{status_cb}"
-      statusCallbackMethod="POST"
-      statusCallbackEvent="start mark stop">
-      <Parameter name="call_sid" value="{call_sid}"/>
-      <Parameter name="from" value="{from_num}"/>
-      <Parameter name="to" value="{to_num}"/>
-    </Stream>
+      url="{settings.PUBLIC_WS_URL}"
+      statusCallback="{settings.PUBLIC_HTTP_ORIGIN}/twilio/status"
+      statusCallbackMethod="POST" />
   </Connect>
 </Response>""".strip()
-
     return HttpResponse(twiml, content_type="text/xml")
+
 
 
 
