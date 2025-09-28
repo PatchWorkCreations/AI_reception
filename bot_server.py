@@ -17,6 +17,9 @@ ECHO_BACK      = os.getenv("ECHO_BACK", "0") == "1"
 # Use a real ElevenLabs voice **ID** from your dashboard (Voices -> copy ID)
 ELEVEN_VOICE   = os.getenv("ELEVENLABS_VOICE_ID", "Bella")
 
+# ---- global per-call cache to avoid re-greeting on Twilio reconnects ----
+GLOBAL_CALLS = {}  # {callSid: {"greeted": True, "last_touch": float}}
+
 SYSTEM_PROMPT = """
 You are the NeuroMed AI receptionist. Be warm, clear, concise, and human-sounding.
 Mission:
@@ -83,6 +86,21 @@ def domain_corrections(text: str) -> str:
     if re.search(r"\b(tell me more|more about)\b", t, flags=re.I) and re.search(r"\bvideo\b", t, flags=re.I):
         t = re.sub(r"\bvideo\b", "NeuroMed AI", t, flags=re.I)
     return t
+
+def looks_like_what_is_neuromed(s: str) -> bool:
+    q = re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower())
+    # direct forms
+    if ("what is" in q) or ("what s" in q) or ("whats" in q):
+        if any(k in q for k in ["neuromed", "neuro med", "neuro-med", "med ai", "mira med", "miura", "miramad"]):
+            return True
+    # fuzzy “tell me more about your …”
+    if "tell me more" in q or "more about" in q:
+        if any(k in q for k in ["your media", "your med", "your ai", "your video", "your system", "your product"]):
+            return True
+    # single-word triggers like "neuromed?" or "what about neuromed"
+    if "neuromed" in q and ("what" in q or "about" in q):
+        return True
+    return False
 
 # --------- Deepgram ASR (ws) ---------
 async def deepgram_stream(pcm_iter):
@@ -178,15 +196,15 @@ async def deepgram_stream(pcm_iter):
                     continue
 
                 # Throttle partials; always emit finals; skip unchanged partials
-                now = time.time()
-                if not (is_final or (now - last_emit) > 0.2):
+                nowt = time.time()
+                if not (is_final or (nowt - last_emit) > 0.2):
                     continue
                 if not is_final and txt == last_sent:
                     continue
 
                 print(f"ASR{'(final)' if is_final else ''} ▶ {txt}")
                 yield txt, is_final
-                last_emit = now
+                last_emit = nowt
                 last_sent = txt
         finally:
             await feed_task
@@ -240,13 +258,6 @@ async def call_faq(q: str) -> str:
         r = await client.get(f"{HTTP_ORIGIN}/api/faq", params={"q": q})
         r.raise_for_status()
         return r.json().get("answer", "")
-
-def looks_like_what_is_neuromed(s: str) -> bool:
-    q = re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower())
-    if ("what is" in q) or ("what s" in q) or ("what's" in q):
-        keywords = ["neuromed", "neuro med", "miura", "miramad", "mira med", "your med ai", "neuro ai", "med ai"]
-        return any(k in q for k in keywords)
-    return False
 
 # --------- Streaming LLM sentences via SSE ---------
 SENTENCE_END = re.compile(r'([.!?…]+)(\s+|$)')
@@ -376,7 +387,6 @@ async def extract_intent_slots(utterance: str) -> dict:
 
     return {"intent":"other"}
 
-
 # --------- Planner (what to say) ---------
 WEAK_CLOSERS = {
   "if you have more questions, feel free to ask.",
@@ -405,7 +415,6 @@ def should_drop_assistant_line(s: str, *, greeted_already: bool) -> bool:
     if greeted_already and (GREETING_RE.search(s0) or ASSIST_RE.search(s0)):
         return True
     return False
-
 
 async def plan_reply(history: list[dict]) -> list[str]:
     """Return a list of sentences to speak. Empty list => use generative streaming."""
@@ -469,6 +478,8 @@ async def handle_twilio(ws):
         "long_answer_until": 0.0,    # grace window while bot is explaining
         "last_ack_ts": 0.0,          # rate limit quick acks
         "local_no_barge_until": 0.0, # per-utterance grace while starting TTS
+        "last_activity_ts": time.time(),  # any media/ASR/TTS updates this
+        "last_nudge_ts": 0.0,             # rate-limit nudges
     }
 
     async def arm_barge_in_after(seconds: float):
@@ -529,8 +540,8 @@ async def handle_twilio(ws):
                     break
 
         # De-dupe: avoid repeating the same line within 2.5s
-        now = time.time()
-        if text == state["last_reply"].strip() and (now - state["last_reply_ts"]) < 2.5:
+        nowt = time.time()
+        if text == state["last_reply"].strip() and (nowt - state["last_reply_ts"]) < 2.5:
             print("TTS ▶ duplicate suppressed")
             return
 
@@ -554,14 +565,17 @@ async def handle_twilio(ws):
                 # Pre-breath (randomized)
                 pre = 120 if len(text.split()) > 1 else 40
                 pre += int(random.uniform(-15, 20))
+                state["last_activity_ts"] = time.time()
                 await send_silence(send_pcm, max(pre, 20))
 
                 async for pcm in eleven_tts_stream(text):
                     any_chunk = True
+                    state["last_activity_ts"] = time.time()
                     await send_pcm(pcm)
 
                 # Post-pause (randomized)
                 post = 60 + int(random.uniform(-15, 25))
+                state["last_activity_ts"] = time.time()
                 await send_silence(send_pcm, max(post, 20))
 
             except asyncio.CancelledError:
@@ -582,6 +596,16 @@ async def handle_twilio(ws):
 
         speak_task = asyncio.create_task(_run())
 
+    # ---- Idle watchdog to avoid dead air ----
+    async def idle_watchdog():
+        while True:
+            await asyncio.sleep(1.0)
+            now = time.time()
+            if state["greeted"] and state["barge_in_enabled"] and not state["speaking"]:
+                if (now - state["last_activity_ts"]) > 10.0 and (now - state["last_nudge_ts"]) > 45.0:
+                    state["last_nudge_ts"] = now
+                    await speak("I’m here if you’d like a quick overview, pricing, or to get started.")
+
     # --------- brain loop ---------
     async def brain():
         if not DEEPGRAM_KEY:
@@ -601,6 +625,10 @@ async def handle_twilio(ws):
             if not utter:
                 continue
 
+            # Domain corrections & mark activity
+            utter = domain_corrections(utter)
+            state["last_activity_ts"] = time.time()
+
             # De-dupe identical emissions
             if utter == last_user_sent:
                 continue
@@ -610,21 +638,18 @@ async def handle_twilio(ws):
             if state["speaking"] and len(utter.split()) <= 1:
                 continue
 
-            # Domain corrections
-            utter = domain_corrections(utter)
-
             # Decide whether to barge: finals >=3 words; partials >=6 words
             # Stricter while in long-answer window (finals >=5 words; partials >=8)
             words = utter.split()
-            nowt = time.time()
-            in_long_window = nowt < state["long_answer_until"]
+            nowl = time.time()
+            in_long_window = nowl < state["long_answer_until"]
 
             barge_on_final = is_final and len(words) >= (5 if in_long_window else 3)
             barge_on_partial = (not is_final) and len(words) >= (8 if in_long_window else 6)
             should_barge = (barge_on_final or barge_on_partial)
 
             # Also respect the local no-barge grace while TTS just started
-            if nowt < state.get("local_no_barge_until", 0):
+            if nowl < state.get("local_no_barge_until", 0):
                 should_barge = False
 
             if should_barge and state.get("barge_in_enabled") and state["speaking"] and speak_task and not speak_task.done():
@@ -637,13 +662,18 @@ async def handle_twilio(ws):
             # Route "what is neuromed" style queries (with typos) to FAQ
             if is_final and looks_like_what_is_neuromed(utter):
                 if not state["speaking"]:
-                    asyncio.create_task(speak("Sure—"))
+                    await speak("Sure—")
                 answer = await call_faq("what_is_neuromed")
                 state["long_answer_until"] = time.time() + 2.0
-                for sentence in re.split(r'(?<=[.!?])\s+', (answer or "").strip()):
-                    if sentence and not should_skip_sentence(sentence):
-                        if not should_drop_assistant_line(sentence, greeted_already=state["greeted"]):
-                            await speak(sentence)
+                sentences = [s for s in re.split(r'(?<=[.!?])\s+', (answer or "").strip()) if s]
+                if sentences:
+                    first, rest = sentences[0], sentences[1:]
+                    if not should_skip_sentence(first) and not should_drop_assistant_line(first, greeted_already=state["greeted"]):
+                        await speak(first)
+                    for sentence in rest:
+                        if sentence and not should_skip_sentence(sentence):
+                            if not should_drop_assistant_line(sentence, greeted_already=state["greeted"]):
+                                await speak(sentence)
                 continue
 
             # Normal: update history
@@ -679,6 +709,7 @@ async def handle_twilio(ws):
                         await speak(sentence)
 
     brain_task = asyncio.create_task(brain())
+    nudge_task = asyncio.create_task(idle_watchdog())
 
     try:
         async for raw in ws:
@@ -686,10 +717,18 @@ async def handle_twilio(ws):
             ev = data.get("event")
 
             if ev == "start":
-                stream_sid = data.get("start", {}).get("streamSid")
-                print(f"WS ▶ start streamSid={stream_sid}")
+                start_info = data.get("start", {}) or {}
+                stream_sid = start_info.get("streamSid")
+                call_sid   = start_info.get("callSid")
+                print(f"WS ▶ start streamSid={stream_sid} callSid={call_sid}")
+                state["last_activity_ts"] = time.time()
+
+                # Per-call global cache to prevent double-greeting on reconnect
+                already = GLOBAL_CALLS.get(call_sid, {})
+                GLOBAL_CALLS[call_sid] = {"greeted": True, "last_touch": time.time()}
+
                 state["barge_in_enabled"] = False  # ensure off at start
-                if not state["greeted"]:
+                if not already.get("greeted") and not state["greeted"]:
                     state["greeted"] = True
                     asyncio.create_task(
                         speak("Hi! I’m the NeuroMed assistant. What do you need today—pricing, hours, or a quick overview?")
@@ -703,6 +742,8 @@ async def handle_twilio(ws):
 
                 media_stats["frames"] += 1
                 media_stats["bytes"]  += len(buf)
+                state["last_activity_ts"] = time.time()
+
                 if media_stats["frames"] == 1:
                     first_media.set()
                     print("WS ▶ first media frame received")
@@ -726,6 +767,13 @@ async def handle_twilio(ws):
         print("WS ERR ▶", e)
     finally:
         await inbound_q.put(None)
+        # cancel idle watchdog
+        nudge_task.cancel()
+        try:
+            await nudge_task
+        except asyncio.CancelledError:
+            pass
+
         await brain_task
         print("WS ▶ closed")
 
