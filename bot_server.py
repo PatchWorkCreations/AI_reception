@@ -73,8 +73,25 @@ async def send_silence(ws_send_pcm, ms: int):
     if ms > 0:
         await ws_send_pcm(_ulaw_silence(ms))
 
+# --------- domain correction for common mishears ---------
+def domain_corrections(text: str) -> str:
+    t = text or ""
+    t = re.sub(r"\bmiu?ra?med\b", "NeuroMed", t, flags=re.I)
+    t = re.sub(r"\bmira\s*med\b", "NeuroMed", t, flags=re.I)
+    t = re.sub(r"\bneuro\s*med\b", "NeuroMed", t, flags=re.I)
+    # “tell me more about ... video” → "… NeuroMed AI"
+    if re.search(r"\b(tell me more|more about)\b", t, flags=re.I) and re.search(r"\bvideo\b", t, flags=re.I):
+        t = re.sub(r"\bvideo\b", "NeuroMed AI", t, flags=re.I)
+    return t
+
 # --------- Deepgram ASR (ws) ---------
 async def deepgram_stream(pcm_iter):
+    """
+    Stream μ-law 8k audio to Deepgram and yield (text, is_final).
+    - Biased for NeuroMed domain words via Configure.
+    - Throttles partials (~200ms), always emits finals.
+    - Handles dict/list channel payload shapes.
+    """
     if not DEEPGRAM_KEY:
         print("ASR WARN ▶ DEEPGRAM_API_KEY missing; ASR disabled.")
         return
@@ -84,6 +101,7 @@ async def deepgram_stream(pcm_iter):
         "?model=nova-2"
         "&encoding=mulaw"
         "&sample_rate=8000"
+        "&language=en-US"
         "&punctuate=true"
         "&interim_results=true"
         "&vad_events=true"
@@ -93,6 +111,15 @@ async def deepgram_stream(pcm_iter):
     headers = [("Authorization", f"Token {DEEPGRAM_KEY}")]
 
     async with websockets.connect(url, extra_headers=headers, max_size=2**20) as dg:
+        # ---- Bias the recognizer toward domain terms (best-effort; ignored if unsupported) ----
+        try:
+            await dg.send(json.dumps({
+                "type": "Configure",
+                "keywords": ["NeuroMed", "NeuroMed AI", "HIPAA", "pilot", "pricing", "faith"]
+            }))
+        except Exception as e:
+            print("DG CONFIG WARN ▶", repr(e))
+
         async def feeder():
             try:
                 async for chunk in pcm_iter():
@@ -117,6 +144,7 @@ async def deepgram_stream(pcm_iter):
 
         try:
             async for msg in dg:
+                # Deepgram sends JSON text frames
                 try:
                     obj = json.loads(msg)
                 except Exception:
@@ -124,8 +152,8 @@ async def deepgram_stream(pcm_iter):
 
                 # Ignore non-transcript events
                 if isinstance(obj, dict) and obj.get("type") in {
-                    "Metadata","Warning","Error","Close","UtteranceEnd",
-                    "SpeechStarted","SpeechFinished"
+                    "Metadata", "Warning", "Error", "Close", "UtteranceEnd",
+                    "SpeechStarted", "SpeechFinished"
                 }:
                     continue
 
@@ -151,8 +179,7 @@ async def deepgram_stream(pcm_iter):
 
                 # Throttle partials; always emit finals; skip unchanged partials
                 now = time.time()
-                should_emit = is_final or (now - last_emit) > 0.2
-                if not should_emit:
+                if not (is_final or (now - last_emit) > 0.2):
                     continue
                 if not is_final and txt == last_sent:
                     continue
@@ -164,6 +191,7 @@ async def deepgram_stream(pcm_iter):
         finally:
             await feed_task
 
+
 # --------- ElevenLabs TTS (ulaw_8000 stream) ---------
 async def eleven_tts_stream(text: str):
     if not ELEVEN_KEY:
@@ -171,7 +199,7 @@ async def eleven_tts_stream(text: str):
 
     url = (
         f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}/stream"
-        "?optimize_streaming_latency=4&output_format=ulaw_8000"
+        "?optimize_streaming_latency=3&output_format=ulaw_8000"
     )
     headers = {
         "xi-api-key": ELEVEN_KEY,
@@ -214,9 +242,8 @@ async def call_faq(q: str) -> str:
         return r.json().get("answer", "")
 
 def looks_like_what_is_neuromed(s: str) -> bool:
-    q = re.sub(r"[^a-z0-9 ]+", " ", s.lower())
+    q = re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower())
     if ("what is" in q) or ("what s" in q) or ("what's" in q):
-        # catch common misspellings / variants
         keywords = ["neuromed", "neuro med", "miura", "miramad", "mira med", "your med ai", "neuro ai", "med ai"]
         return any(k in q for k in keywords)
     return False
@@ -292,31 +319,63 @@ INTENT_SCHEMA = {
 }
 
 async def extract_intent_slots(utterance: str) -> dict:
-    prompt = {
-        "role":"system",
-        "content": "Extract the user's intent and any available contact info. Respond with pure JSON only."
-    }
-    user = {"role":"user","content": utterance}
-    async with httpx.AsyncClient(timeout=None) as client:
-        r = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            json={
-                "model": OPENAI_MODEL,
-                "temperature": 0.0,
-                "response_format": {
-                    "type":"json_schema",
-                    "json_schema":{"name":"intent","schema":INTENT_SCHEMA,"strict":True}
+    """
+    Use Chat Completions tool-calling to force a structured JSON result.
+    Falls back gracefully if anything goes wrong.
+    """
+    tool_schema = {
+        "type": "function",
+        "function": {
+            "name": "set_intent",
+            "description": "Set the user's intent and any available contact info.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "intent": {"type": "string", "enum": [
+                        "greeting","what_is","hipaa","pricing","faith_mode","pilot","hours",
+                        "address","schedule_contact","smalltalk","other"
+                    ]},
+                    "name":  {"type":"string"},
+                    "email": {"type":"string"},
+                    "org":   {"type":"string"},
+                    "notes": {"type":"string"}
                 },
-                "messages": [prompt, user]
+                "required": ["intent"],
+                "additionalProperties": False
             }
-        )
-        r.raise_for_status()
-        data = r.json()["choices"][0]["message"]["content"]
-        try:
-            return json.loads(data)
-        except Exception:
-            return {"intent":"other"}
+        }
+    }
+
+    sys = {"role":"system","content":"Given the last user utterance, call the set_intent function with extracted fields. If uncertain, use intent='other'."}
+    usr = {"role":"user","content": utterance}
+
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            r = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                json={
+                    "model": OPENAI_MODEL,
+                    "temperature": 0.0,
+                    "messages": [sys, usr],
+                    "tools": [tool_schema],
+                    "tool_choice": {"type":"function","function":{"name":"set_intent"}},
+                }
+            )
+            r.raise_for_status()
+            msg = r.json()["choices"][0]["message"]
+            tool_calls = msg.get("tool_calls") or []
+            if tool_calls and tool_calls[0]["function"]["name"] == "set_intent":
+                args_raw = tool_calls[0]["function"].get("arguments") or "{}"
+                try:
+                    return json.loads(args_raw)
+                except Exception:
+                    return {"intent":"other"}
+    except Exception as e:
+        print("INTENT ERROR ▶", repr(e))
+
+    return {"intent":"other"}
+
 
 # --------- Planner (what to say) ---------
 WEAK_CLOSERS = {
@@ -331,6 +390,22 @@ WEAK_CLOSERS = {
 
 def should_skip_sentence(s: str) -> bool:
     return (s or "").strip().lower() in WEAK_CLOSERS
+
+GREETING_RE = re.compile(r"^(hi|hello|hey)[,!.\s]*(?:i'?m|this is)?\b", re.I)
+ASSIST_RE   = re.compile(r"\b(how can i (?:help|assist)|let me know|feel free to ask)\b", re.I)
+
+def should_drop_assistant_line(s: str, *, greeted_already: bool) -> bool:
+    s0 = (s or "").strip()
+    if not s0:
+        return True
+    low = s0.lower()
+    if low in WEAK_CLOSERS:
+        return True
+    # After greeting, block “Hello/Hi … how can I assist…” repetitions
+    if greeted_already and (GREETING_RE.search(s0) or ASSIST_RE.search(s0)):
+        return True
+    return False
+
 
 async def plan_reply(history: list[dict]) -> list[str]:
     """Return a list of sentences to speak. Empty list => use generative streaming."""
@@ -392,6 +467,8 @@ async def handle_twilio(ws):
         "last_reply_ts": 0.0,
         "barge_in_enabled": False,   # armed after greeting grace
         "long_answer_until": 0.0,    # grace window while bot is explaining
+        "last_ack_ts": 0.0,          # rate limit quick acks
+        "local_no_barge_until": 0.0, # per-utterance grace while starting TTS
     }
 
     async def arm_barge_in_after(seconds: float):
@@ -408,8 +485,13 @@ async def handle_twilio(ws):
     QUICK_ACKS = ["Okay.", "Got it.", "Sure.", "Alright.", "Understood.", "One moment."]
 
     async def quick_ack():
-        if not state["speaking"]:
-            await speak(random.choice(QUICK_ACKS))
+        now = time.time()
+        if state["speaking"]:
+            return
+        if now - state["last_ack_ts"] < 1.2:
+            return
+        state["last_ack_ts"] = now
+        await speak(random.choice(QUICK_ACKS))
 
     async def pcm_iter():
         while True:
@@ -430,7 +512,8 @@ async def handle_twilio(ws):
         Cancelable TTS via ElevenLabs, streamed back to Twilio.
         - Cancels any in-flight TTS (barge-in)
         - Suppresses duplicate replies within 2.5s
-        - Adds small pre/post silences for natural pacing
+        - Adds small randomized pre/post silences for natural pacing
+        - Per-utterance no-barge grace (~1.2s)
         """
         nonlocal stream_sid, speak_task
 
@@ -463,22 +546,31 @@ async def handle_twilio(ws):
             state["speaking"] = True
             any_chunk = False
             cancelled = False
+            # Per-utterance no-barge grace
+            prev_barge = state.get("barge_in_enabled", False)
+            state["local_no_barge_until"] = time.time() + 1.2
+
             try:
-                # Pre-breath (120 ms)
-                await send_silence(send_pcm, 120)
+                # Pre-breath (randomized)
+                pre = 120 if len(text.split()) > 1 else 40
+                pre += int(random.uniform(-15, 20))
+                await send_silence(send_pcm, max(pre, 20))
 
                 async for pcm in eleven_tts_stream(text):
                     any_chunk = True
                     await send_pcm(pcm)
 
-                # Post-pause (80 ms)
-                await send_silence(send_pcm, 80)
+                # Post-pause (randomized)
+                post = 60 + int(random.uniform(-15, 25))
+                await send_silence(send_pcm, max(post, 20))
 
             except asyncio.CancelledError:
                 cancelled = True
                 print("TTS ▶ canceled (barge-in)")
                 raise
             finally:
+                # restore barge-in to its previous state
+                state["barge_in_enabled"] = prev_barge
                 state["speaking"] = False
                 if any_chunk:
                     state["last_reply"] = text
@@ -490,6 +582,7 @@ async def handle_twilio(ws):
 
         speak_task = asyncio.create_task(_run())
 
+    # --------- brain loop ---------
     async def brain():
         if not DEEPGRAM_KEY:
             return
@@ -517,15 +610,22 @@ async def handle_twilio(ws):
             if state["speaking"] and len(utter.split()) <= 1:
                 continue
 
+            # Domain corrections
+            utter = domain_corrections(utter)
+
             # Decide whether to barge: finals >=3 words; partials >=6 words
             # Stricter while in long-answer window (finals >=5 words; partials >=8)
             words = utter.split()
-            now = time.time()
-            in_long_window = now < state["long_answer_until"]
+            nowt = time.time()
+            in_long_window = nowt < state["long_answer_until"]
 
             barge_on_final = is_final and len(words) >= (5 if in_long_window else 3)
             barge_on_partial = (not is_final) and len(words) >= (8 if in_long_window else 6)
             should_barge = (barge_on_final or barge_on_partial)
+
+            # Also respect the local no-barge grace while TTS just started
+            if nowt < state.get("local_no_barge_until", 0):
+                should_barge = False
 
             if should_barge and state.get("barge_in_enabled") and state["speaking"] and speak_task and not speak_task.done():
                 speak_task.cancel()
@@ -542,26 +642,39 @@ async def handle_twilio(ws):
                 state["long_answer_until"] = time.time() + 2.0
                 for sentence in re.split(r'(?<=[.!?])\s+', (answer or "").strip()):
                     if sentence and not should_skip_sentence(sentence):
-                        await speak(sentence)
+                        if not should_drop_assistant_line(sentence, greeted_already=state["greeted"]):
+                            await speak(sentence)
                 continue
 
             # Normal: update history
             history.append({"role": "user", "content": utter})
+
+            # Acknowledge brief, final utterances to feel quick
+            if is_final and len(words) <= 6:
+                asyncio.create_task(quick_ack())
 
             # Only act on final turns (partials accumulate)
             if is_final:
                 # Grace window while we speak the reply
                 state["long_answer_until"] = time.time() + 2.0
 
-                plan = await plan_reply(history)
+                # Plan with robust fallback
+                try:
+                    plan = await plan_reply(history)
+                except Exception as e:
+                    print("PLAN ERROR ▶", repr(e))
+                    plan = []
+
                 if plan:
                     for sentence in plan:
+                        if should_drop_assistant_line(sentence, greeted_already=state["greeted"]):
+                            continue
                         await speak(sentence)
                 else:
                     # No plan => stream generative with SYSTEM + FEWSHOTS + history
                     gen_messages = [{"role":"system","content": SYSTEM_PROMPT}, *FEWSHOTS, *history]
                     async for sentence in stream_llm_sentences(gen_messages):
-                        if should_skip_sentence(sentence):
+                        if should_skip_sentence(sentence) or should_drop_assistant_line(sentence, greeted_already=state["greeted"]):
                             continue
                         await speak(sentence)
 
