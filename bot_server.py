@@ -201,28 +201,28 @@ async def deepgram_stream(pcm_iter):
         finally:
             await feed_task
 
-# --------- ElevenLabs TTS (ulaw_8000 stream) ---------
+# --------- ElevenLabs TTS (ulaw_8000 stream) — with quick retry ---------
 async def eleven_tts_stream(text: str):
     if not ELEVEN_KEY:
         raise RuntimeError("ELEVENLABS_API_KEY missing.")
 
-    url = (
-        f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}/stream"
-        "?optimize_streaming_latency=3&output_format=ulaw_8000"
-    )
-    headers = {
-        "xi-api-key": ELEVEN_KEY,
-        "Content-Type": "application/json",
-        "Accept": "*/*",
-    }
-    payload = {
-        "text": text,
-        "model_id": "eleven_multilingual_v2",
-        "voice_settings": {"stability": 0.5, "similarity_boost": 0.8},
-    }
+    async def _do():
+        url = (
+            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}/stream"
+            "?optimize_streaming_latency=3&output_format=ulaw_8000"
+        )
+        headers = {
+            "xi-api-key": ELEVEN_KEY,
+            "Content-Type": "application/json",
+            "Accept": "*/*",
+        }
+        payload = {
+            "text": text,
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.8},
+        }
 
-    async with httpx.AsyncClient(timeout=None) as client:
-        try:
+        async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream("POST", url, headers=headers, json=payload) as r:
                 if r.is_error:
                     body = await r.aread()
@@ -231,17 +231,16 @@ async def eleven_tts_stream(text: str):
                 async for chunk in r.aiter_bytes():
                     if chunk:
                         yield chunk
-        except httpx.HTTPStatusError as e:
-            body = b""
-            try:
-                body = await e.response.aread()
-            except Exception:
-                pass
-            print("ELEVENLABS EXC ▶", getattr(e.response, "status_code", "?"), body[:200])
-            return
-        except Exception as e:
-            print("ELEVENLABS ERROR ▶", repr(e))
-            return
+
+    # Try once; if no audio comes out, retry quickly
+    got_audio = False
+    async for c in _do():
+        got_audio = True
+        yield c
+    if not got_audio:
+        print("ELEVENLABS WARN ▶ no audio; quick retry")
+        async for c in _do():
+            yield c
 
 # --------- Simple tool call to your Django FAQ ---------
 async def call_faq(q: str) -> str:
@@ -409,9 +408,16 @@ def should_drop_assistant_line(s: str, *, greeted_already: bool) -> bool:
     low = s0.lower()
     if low in WEAK_CLOSERS:
         return True
-    # After greeting, block “Hello/Hi … how can I assist…” repetitions
-    if greeted_already and (GREETING_RE.search(s0) or ASSIST_RE.search(s0)):
+
+    # After greeting, allow one acknowledgment if it contains real info.
+    # Only drop if it's a pure greeter or pure "assist" line with no substance.
+    has_substance = bool(re.search(r"\b(neuromed|medical|files?|summary|pricing|pilot|demo|email|upload|church|caregivers?)\b", low))
+    is_greetingish = bool(GREETING_RE.search(s0))
+    is_assistish   = bool(ASSIST_RE.search(s0))
+
+    if greeted_already and (is_greetingish or is_assistish) and not has_substance:
         return True
+
     return False
 
 def should_block_contact_line(s: str, *, allow_contact_request: bool) -> bool:
@@ -436,6 +442,36 @@ def extract_contact_inline(txt: str) -> dict:
     if m2:
         out["name"] = m2.group(1).strip()
     return out
+
+# ---- speech safety net ----
+LAST_SPOKEN_AT = 0.0
+
+async def speak_lines(lines: list[str], *, greeted_already: bool, allow_contact_request: bool) -> int:
+    """
+    Filter + speak a batch of sentences safely.
+    Returns count of lines actually spoken. If zero after filtering, emits a friendly fallback.
+    """
+    global LAST_SPOKEN_AT
+    spoken = 0
+    for sentence in lines:
+        if should_skip_sentence(sentence):
+            continue
+        if should_block_contact_line(sentence, allow_contact_request=allow_contact_request):
+            continue
+        if should_drop_assistant_line(sentence, greeted_already=greeted_already):
+            continue
+        await speak(sentence)
+        spoken += 1
+        LAST_SPOKEN_AT = time.time()
+
+    if spoken == 0:
+        # Friendly, non-greeter fallback so we never go silent
+        fallback = "Okay—would you like an overview, pricing, or to get started with a quick demo?"
+        await speak(fallback)
+        LAST_SPOKEN_AT = time.time()
+        spoken = 1
+
+    return spoken
 
 async def plan_reply(history: list[dict], state: dict | None = None) -> list[str]:
     """Return a list of sentences to speak. Empty list => use generative streaming."""
@@ -485,6 +521,8 @@ async def handle_twilio(ws):
 
     print("WS ▶ Twilio connected, path:", ws.path)
     print("WS ▶ protocol negotiated:", ws.subprotocol)
+    if ws.subprotocol not in (None, "audio.twilio.com"):
+        print("WS WARN ▶ unexpected subprotocol:", ws.subprotocol)
 
     inbound_q: asyncio.Queue[bytes] = asyncio.Queue()
     history = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -663,10 +701,12 @@ async def handle_twilio(ws):
                     asyncio.create_task(speak("Sure—"))
                 answer = await call_faq("what_is_neuromed")
                 state["long_answer_until"] = time.time() + 2.0
-                for sentence in re.split(r'(?<=[.!?])\s+', (answer or "").strip()):
-                    if sentence and not should_skip_sentence(sentence):
-                        if not should_drop_assistant_line(sentence, greeted_already=state["greeted"]):
-                            await speak(sentence)
+                sentences = [s for s in re.split(r'(?<=[.!?])\s+', (answer or "").strip()) if s]
+                await speak_lines(
+                    sentences,
+                    greeted_already=state["greeted"],
+                    allow_contact_request=state["allow_contact_request"]
+                )
                 return
 
             # Normal: add to history
@@ -674,7 +714,7 @@ async def handle_twilio(ws):
 
             # Quick ack for short turns
             if len(words) <= 6:
-                asyncio.create_task(quick_ack())
+                asyncio.create_task(quick_ack()))
 
             # Plan or generative
             state["long_answer_until"] = time.time() + 2.0
@@ -685,24 +725,22 @@ async def handle_twilio(ws):
                 plan = []
 
             if plan:
-                for sentence in plan:
-                    if should_skip_sentence(sentence):
-                        continue
-                    if should_block_contact_line(sentence, allow_contact_request=state["allow_contact_request"]):
-                        continue
-                    if should_drop_assistant_line(sentence, greeted_already=state["greeted"]):
-                        continue
-                    await speak(sentence)
+                await speak_lines(
+                    plan,
+                    greeted_already=state["greeted"],
+                    allow_contact_request=state["allow_contact_request"]
+                )
             else:
                 gen_messages = [{"role":"system","content": SYSTEM_PROMPT}, *FEWSHOTS, *history]
+                gen_buffer = []
                 async for sentence in stream_llm_sentences(gen_messages):
-                    if should_skip_sentence(sentence):
-                        continue
-                    if should_block_contact_line(sentence, allow_contact_request=state["allow_contact_request"]):
-                        continue
-                    if should_drop_assistant_line(sentence, greeted_already=state["greeted"]):
-                        continue
-                    await speak(sentence)
+                    gen_buffer.append(sentence)
+                # speak the collected sentences as a batch (ensures fallback if all filtered)
+                await speak_lines(
+                    gen_buffer,
+                    greeted_already=state["greeted"],
+                    allow_contact_request=state["allow_contact_request"]
+                )
 
         async for utter, is_final in deepgram_stream(pcm_iter):
             if not utter:
@@ -760,7 +798,7 @@ async def handle_twilio(ws):
                 if not state["greeted"]:
                     state["greeted"] = True
                     asyncio.create_task(
-                        speak("Hello, you’ve reached NeuraMed AI — where we turn complex medical notes into clear, compassionate summaries for families and caregivers. How may I help you today?")
+                        speak("Hello, you’ve reached NeuroMed AI — where we turn complex medical notes into clear, compassionate summaries for families and caregivers. How may I help you today?")
                     )
                     # fallback arming in case first media is late
                     asyncio.create_task(arm_barge_in_after(1.5))
