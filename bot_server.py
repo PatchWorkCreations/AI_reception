@@ -714,7 +714,7 @@ async def handle_twilio(ws):
 
             # Quick ack for short turns
             if len(words) <= 6:
-                asyncio.create_task(quick_ack()))
+                asyncio.create_task(quick_ack())
 
             # Plan or generative
             state["long_answer_until"] = time.time() + 2.0
