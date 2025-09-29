@@ -77,8 +77,16 @@ def _ulaw_silence(ms: int) -> bytes:
     return b"\xff" * int(8 * ms)
 
 async def send_silence(ws_send_pcm, ms: int):
-    if ms > 0:
+    if ms <= 0:
+        return
+    try:
+        # ws_send_pcm may return bool in our local impl; ignore the result
         await ws_send_pcm(_ulaw_silence(ms))
+    except (websockets.exceptions.ConnectionClosedOK,
+            websockets.exceptions.ConnectionClosedError):
+        # Swallow: the caller will see conn_open=False on next check
+        pass
+
 
 # --------- domain correction for common mishears (PATCH 1) ---------
 def domain_corrections(text: str) -> str:
@@ -559,12 +567,24 @@ async def handle_twilio(ws):
                 break
             yield b
 
-    async def send_pcm(pcm: bytes):
-        await ws.send(json.dumps({
-            "event": "media",
-            "streamSid": stream_sid,
-            "media": {"payload": bytes_to_b64(pcm)}
-        }))
+    conn_open = True
+
+    async def send_pcm(pcm: bytes) -> bool:
+        """Safe media sender. Returns False if connection is closed."""
+        nonlocal conn_open, stream_sid
+        if not conn_open or not stream_sid:
+            return False
+        try:
+            await ws.send(json.dumps({
+                "event": "media",
+                "streamSid": stream_sid,
+                "media": {"payload": bytes_to_b64(pcm)}
+            }))
+            return True
+        except (websockets.exceptions.ConnectionClosedOK,
+                websockets.exceptions.ConnectionClosedError):
+            conn_open = False
+            return False
 
     async def speak(text: str):
         """
@@ -573,21 +593,24 @@ async def handle_twilio(ws):
         - Suppresses duplicate replies within 2.5s
         - Adds small randomized pre/post silences for natural pacing
         - Per-utterance no-barge grace (~1.2s)
+        - Safe against WS closes (won't try to send after close)
         """
-        nonlocal stream_sid, speak_task
+        nonlocal stream_sid, speak_task, conn_open
 
         text = (text or "").strip()
         if not text:
             return
 
-        # Wait for Twilio 'start' so we have a streamSid
+        # Wait for Twilio 'start' so we have a streamSid (but don't wait forever or after close)
         if not stream_sid:
-            for _ in range(100):
-                await asyncio.sleep(0.01)
-                if stream_sid:
+            for _ in range(200):                  # up to ~1s total
+                if stream_sid or not conn_open:
                     break
+                await asyncio.sleep(0.005)
+            if not stream_sid or not conn_open:
+                return
 
-        # De-dupe
+        # De-dupe within 2.5s window
         now = time.time()
         if text == state["last_reply"].strip() and (now - state["last_reply_ts"]) < 2.5:
             print("TTS ▶ duplicate suppressed")
@@ -605,19 +628,30 @@ async def handle_twilio(ws):
             state["speaking"] = True
             any_chunk = False
             cancelled = False
+
             # Per-utterance no-barge grace
             prev_barge = state.get("barge_in_enabled", False)
             state["local_no_barge_until"] = time.time() + 1.2
 
             try:
-                # Pre-breath (randomized)
+                if not conn_open or not stream_sid:
+                    return
+
+                # Pre-breath (randomized, kept short for snappiness)
                 pre = 60 if len(text.split()) > 1 else 30
                 pre += int(random.uniform(-15, 20))
                 await send_silence(send_pcm, max(pre, 20))
 
+                # Stream audio; STOP immediately if socket closes
                 async for pcm in eleven_tts_stream(text):
                     any_chunk = True
-                    await send_pcm(pcm)
+                    ok = await send_pcm(pcm)
+                    if not ok:
+                        # connection is closed; stop trying to speak
+                        return
+
+                if not conn_open:
+                    return
 
                 # Post-pause (randomized)
                 post = 60 + int(random.uniform(-15, 25))
@@ -639,6 +673,7 @@ async def handle_twilio(ws):
                         print("TTS ▶ no audio produced (check TTS provider)")
 
         speak_task = asyncio.create_task(_run())
+
 
     
     async def speak_lines(lines: list[str], *, greeted_already: bool, allow_contact_request: bool) -> int:
@@ -881,19 +916,39 @@ async def handle_twilio(ws):
                 await inbound_q.put(buf)
 
                 # Optional loopback: only for debugging when ECHO_BACK=1
-                if ECHO_BACK and stream_sid:
+                if ECHO_BACK and stream_sid and conn_open:
                     await send_pcm(buf)
+
+
 
             elif ev == "stop":
                 print("WS ▶ stop")
+                conn_open = False
+                # Cancel any in-flight TTS so it doesn't try to send after close
+                if speak_task and not speak_task.done():
+                    speak_task.cancel()
+                    try:
+                        await speak_task
+                    except asyncio.CancelledError:
+                        pass
                 break
+
 
     except Exception as e:
         print("WS ERR ▶", e)
     finally:
+        conn_open = False
         await inbound_q.put(None)
+        # Also cancel any lingering speak task to avoid "Task exception was never retrieved"
+        if speak_task and not speak_task.done():
+            speak_task.cancel()
+            try:
+                await speak_task
+            except asyncio.CancelledError:
+                pass
         await brain_task
         print("WS ▶ closed")
+
 
 async def main():
     # Quick env prints
