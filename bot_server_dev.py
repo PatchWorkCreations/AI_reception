@@ -10,7 +10,7 @@ OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 DEEPGRAM_KEY   = os.getenv("DEEPGRAM_API_KEY")
 ELEVEN_KEY     = os.getenv("ELEVENLABS_API_KEY")
 HTTP_ORIGIN    = os.getenv("PUBLIC_HTTP_ORIGIN", "http://localhost:8000")
-PORT           = int(os.getenv("PORT", "8080"))
+PORT           = int(os.getenv("DEV_WS_PORT", "8080"))
 
 # Toggle to debug the audio path: 1 = echo caller audio back immediately
 ECHO_BACK      = os.getenv("ECHO_BACK", "0") == "1"
@@ -760,7 +760,7 @@ async def handle_twilio(ws):
                 if not state["greeted"]:
                     state["greeted"] = True
                     asyncio.create_task(
-                        speak("Hello, you’ve reached NeuraMed AI — where we turn complex medical notes into clear, compassionate summaries for families and caregivers. How may I help you today?")
+                        speak("Hi! I’m the NeuroMed assistant. What do you need today—pricing, hours, or a quick overview?")
                     )
                     # fallback arming in case first media is late
                     asyncio.create_task(arm_barge_in_after(1.5))

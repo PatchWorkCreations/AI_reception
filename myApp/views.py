@@ -70,3 +70,14 @@ def ws_url_debug(request):
         "PUBLIC_WS_URL": settings.PUBLIC_WS_URL,
         "PUBLIC_HTTP_ORIGIN": settings.PUBLIC_HTTP_ORIGIN,
     })
+
+
+
+# myApp/views.py
+from django.shortcuts import render
+
+def dev_client(request):
+    # Optional: pass WS url from settings; or rely on the default in the HTML.
+    return render(request, "dev_client.html", {
+        "WS_URL": getattr(settings, "DEV_PUBLIC_WS_URL", "ws://localhost:8080/ws/twilio")
+    })
