@@ -19,8 +19,12 @@ ELEVEN_VOICE   = os.getenv("ELEVENLABS_VOICE_ID", "Bella")
 
 SYSTEM_PROMPT = """
 You are the NeuroMed AI receptionist. Be warm, clear, concise, and human-sounding.
+
 Mission:
 - NeuroMed AI helps families, caregivers, and clinics by turning medical files (discharge notes, labs, imaging) into plain-language summaries, with optional styles: plain, caregiver-friendly, faith + encouragement, or clinical.
+
+CRITICAL SCOPE LIMIT:
+- Callers are contacting about NeuroMed only. If asked anything unrelated to NeuroMed's product, privacy, pricing, pilots, faith mode, demo, or support, politely say you can only answer questions about NeuroMed and offer to email more info.
 
 Guardrails:
 - Do not give medical advice or diagnose. Never promise unlisted features. Avoid speculative claims.
@@ -29,14 +33,14 @@ Guardrails:
 - If the user wants next steps, politely collect name + email.
 
 Style:
-- Sound human and warm. 1–2 sentences by default; longer only for the “what is NeuroMed AI” explanation (~30–60s).
+- 1–2 sentences by default; longer only for the “what is NeuroMed AI” explanation (~30–60s).
 - Use light natural pacing (brief pauses are added by the audio layer). Avoid filler endings like “feel free to ask more questions.”
 - If the user greets or backchannels (“okay”, “yeah”), acknowledge briefly and continue.
 - If the user is unclear, ask a short clarifying question.
 
 Output Rules:
-- Stay on purpose: clarity, comfort, compassion. Use American English only (no code-switching).
-- Never end with generic closers (“feel free to ask”, “how can I assist further?”) unless explicitly requested.
+- Stay on purpose: clarity, comfort, compassion. American English only.
+- Never end with generic closers unless explicitly requested.
 """
 
 # Few-shots to teach tone (not scripts)
@@ -63,7 +67,6 @@ WHAT_IS_FALLBACK = (
   "It’s built to help families, caregivers, and clinics find clarity quickly without medical advice."
 )
 
-
 # --------- helpers ---------
 def b64_to_bytes(s: str) -> bytes:
     return base64.b64decode(s)
@@ -80,24 +83,31 @@ async def send_silence(ws_send_pcm, ms: int):
     if ms <= 0:
         return
     try:
-        # ws_send_pcm may return bool in our local impl; ignore the result
+        # ws_send_pcm returns bool in our local implementation; we can ignore it here
         await ws_send_pcm(_ulaw_silence(ms))
     except (websockets.exceptions.ConnectionClosedOK,
             websockets.exceptions.ConnectionClosedError):
-        # Swallow: the caller will see conn_open=False on next check
+        # Connection closed mid-silence; safe to ignore
         pass
 
-
-# --------- domain correction for common mishears (PATCH 1) ---------
+# --------- domain correction for common mishears ---------
 def domain_corrections(text: str) -> str:
     t = (text or "").strip()
 
-    # Common brand/name mishears
-    t = re.sub(r"\bmiu?ra?med\b", "NeuroMed", t, flags=re.I)
-    t = re.sub(r"\bmira\s*med\b", "NeuroMed", t, flags=re.I)
-    t = re.sub(r"\bneuro\s*med\b", "NeuroMed", t, flags=re.I)
+    # Common brand/name mishears → "NeuroMed" / "NeuroMed AI"
+    subs = [
+        (r"\bmiu?ra?med\b", "NeuroMed"),
+        (r"\bmira\s*med\b", "NeuroMed"),
+        (r"\bneuro\s*med\b", "NeuroMed"),
+        (r"\bneuro\s*mediate\b", "NeuroMed AI"),
+        (r"\bneuro\s*media(te)?\b", "NeuroMed AI"),
+        (r"\bneuro\s*mid\b", "NeuroMed"),
+        (r"\bneuro\s*med(ai| a[i1])\b", "NeuroMed AI"),
+    ]
+    for pat, repl in subs:
+        t = re.sub(pat, repl, t, flags=re.I)
 
-    # “… tell me more / more about … video/media” → “NeuroMed AI”
+    # “… tell me more / more about … (video|media)” → “… NeuroMed AI”
     if re.search(r"\b(tell me more|more about)\b", t, flags=re.I) and re.search(r"\b(video|media)\b\.?\??$", t, flags=re.I):
         t = re.sub(r"\b(video|media)\b\.?\??$", "NeuroMed AI", t, flags=re.I)
 
@@ -111,6 +121,16 @@ def domain_corrections(text: str) -> str:
         t = re.sub(r"\byour\s+(?:ai|app|system)?\s*\??$", "NeuroMed AI?", t, flags=re.I)
 
     return t
+
+def looks_like_what_is_neuromed(s: str) -> bool:
+    q = re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower())
+    if ("what is" in q) or ("what s" in q) or ("what's" in q) or ("tell me more" in q):
+        keywords = [
+            "neuromed", "neuro med", "mira med", "miramad", "miuramed",
+            "neuro mediate", "neuro media", "neuro med ai", "neuro ai", "med ai"
+        ]
+        return any(k in q for k in keywords)
+    return False
 
 # --------- Deepgram ASR (ws) ---------
 async def deepgram_stream(pcm_iter):
@@ -257,10 +277,9 @@ async def eleven_tts_stream(text: str):
         async for c in _do():
             yield c
 
-# --------- Simple tool call to your Django FAQ ---------
+# --------- Simple tool call to your Django FAQ (with tight timeouts) ---------
 async def call_faq(q: str) -> str:
     try:
-        # Keep this snappy: small connect/read timeouts so we don't block TTS.
         timeout = httpx.Timeout(connect=1.0, read=2.5, write=2.5, pool=2.5)
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.get(f"{HTTP_ORIGIN}/api/faq", params={"q": q})
@@ -269,15 +288,6 @@ async def call_faq(q: str) -> str:
     except Exception as e:
         print("FAQ WARN ▶", repr(e))
         return ""
-
-
-
-def looks_like_what_is_neuromed(s: str) -> bool:
-    q = re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower())
-    if ("what is" in q) or ("what s" in q) or ("what's" in q):
-        keywords = ["neuromed", "neuro med", "miura", "miramad", "mira med", "your med ai", "neuro ai", "med ai"]
-        return any(k in q for k in keywords)
-    return False
 
 # --------- Streaming LLM sentences via SSE ---------
 SENTENCE_END = re.compile(r'([.!?…]+)(\s+|$)')
@@ -333,7 +343,7 @@ async def stream_llm_sentences(messages: list[dict]):
     if tail:
         yield tail
 
-# --------- Intent & slot extraction ---------
+# --------- Intent & slot extraction (kept, but scope-limited by SYSTEM_PROMPT) ---------
 INTENT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -350,10 +360,6 @@ INTENT_SCHEMA = {
 }
 
 async def extract_intent_slots(utterance: str) -> dict:
-    """
-    Use Chat Completions tool-calling to force a structured JSON result.
-    Falls back gracefully if anything goes wrong.
-    """
     tool_schema = {
         "type": "function",
         "function": {
@@ -466,10 +472,6 @@ def extract_contact_inline(txt: str) -> dict:
         out["name"] = m2.group(1).strip()
     return out
 
-# ---- speech safety net ----
-LAST_SPOKEN_AT = 0.0
-
-
 async def plan_reply(history: list[dict], state: dict | None = None) -> list[str]:
     """Return a list of sentences to speak. Empty list => use generative streaming."""
     last = (history[-1]["content"] if history else "").strip()
@@ -492,11 +494,7 @@ async def plan_reply(history: list[dict], state: dict | None = None) -> list[str
         return ["We operate online and partner with facilities; if you share your city, I can route you."]
 
     if intent == "what_is":
-        text = (
-          "NeuroMed AI turns medical files like discharge notes, labs, and imaging into plain-language summaries. "
-          "You can choose the tone—plain, caregiver-friendly, faith + encouragement, or clinical—so it meets the moment. "
-          "It’s built to help families, caregivers, and clinics find clarity quickly without medical advice."
-        )
+        text = WHAT_IS_FALLBACK
         return [s for s in re.split(r'(?<=[.!?])\s+', text) if s and not should_skip_sentence(s)]
 
     if intent == "schedule_contact":
@@ -506,8 +504,8 @@ async def plan_reply(history: list[dict], state: dict | None = None) -> list[str
             return [f"Thanks, {name}. We’ll email next steps to {email} shortly."]
         return ["Great—could I have your name and best email so we can send next steps?"]
 
-    # Fallback to generative (use FEWSHOTS + SYSTEM_PROMPT)
-    return []
+    # Strict scope limit: if it's not clearly related to NeuroMed, gently redirect
+    return ["I can help with NeuroMed only—overview, privacy, pricing, faith mode, or getting started. Which would you like?"]
 
 # --------- Twilio Media Streams WS server ---------
 async def handle_twilio(ws):
@@ -538,6 +536,11 @@ async def handle_twilio(ws):
         "contact": {"name": None, "email": None},
     }
 
+    # connection flag + safe media sender
+    conn_open = True
+    stream_sid = None
+    speak_task: asyncio.Task | None = None
+
     async def arm_barge_in_after(seconds: float):
         await asyncio.sleep(seconds)
         state["barge_in_enabled"] = True
@@ -546,28 +549,12 @@ async def handle_twilio(ws):
     media_stats = {"frames": 0, "bytes": 0}
     first_media = asyncio.Event()
 
-    speak_task: asyncio.Task | None = None
-    stream_sid = None
-
-    QUICK_ACKS = ["Okay.", "Got it.", "Sure.", "Alright.", "Understood.", "One moment."]
-
-    async def quick_ack():
-        now = time.time()
-        if state["speaking"]:
-            return
-        if now - state["last_ack_ts"] < 1.2:
-            return
-        state["last_ack_ts"] = now
-        await speak(random.choice(QUICK_ACKS))
-
     async def pcm_iter():
         while True:
             b = await inbound_q.get()
             if b is None:
                 break
             yield b
-
-    conn_open = True
 
     async def send_pcm(pcm: bytes) -> bool:
         """Safe media sender. Returns False if connection is closed."""
@@ -674,14 +661,12 @@ async def handle_twilio(ws):
 
         speak_task = asyncio.create_task(_run())
 
-
-    
+    # ---- speak_lines helper lives INSIDE handle_twilio so it can call speak() ----
     async def speak_lines(lines: list[str], *, greeted_already: bool, allow_contact_request: bool) -> int:
         """
         Filter + speak a batch of sentences safely.
         Returns count of lines actually spoken. If zero after filtering, emits a friendly fallback.
         """
-        global LAST_SPOKEN_AT
         spoken = 0
         for sentence in lines:
             if should_skip_sentence(sentence):
@@ -692,18 +677,15 @@ async def handle_twilio(ws):
                 continue
             await speak(sentence)
             spoken += 1
-            LAST_SPOKEN_AT = time.time()
 
         if spoken == 0:
             # Friendly, non-greeter fallback so we never go silent
-            fallback = "Okay—would you like an overview, pricing, or to get started with a quick demo?"
-            await speak(fallback)
-            LAST_SPOKEN_AT = time.time()
+            await speak("Okay—would you like an overview, pricing, or to get started with a quick demo?")
             spoken = 1
 
         return spoken
 
-    # --------- brain loop with final debouncing (PATCH 2) ---------
+    # --------- brain loop with fast debounce and universal fast-path ---------
     async def brain():
         if not DEEPGRAM_KEY:
             return
@@ -720,115 +702,116 @@ async def handle_twilio(ws):
         pending_ts = 0.0
 
         async def process_final_utterance(text: str):
-            fixed = domain_corrections(text or "")
-            if not fixed:
-                return
+            try:
+                fixed = domain_corrections(text or "")
+                if not fixed:
+                    return
+                print("ROUTER ▶", fixed)
 
-            # Opportunistic contact extraction
-            info = extract_contact_inline(fixed)
-            if "email" in info:
-                state["contact"]["email"] = info["email"]
-            if "name" in info and not state["contact"]["name"]:
-                state["contact"]["name"] = info["name"]
+                # Opportunistic contact extraction
+                info = extract_contact_inline(fixed)
+                if "email" in info:
+                    state["contact"]["email"] = info["email"]
+                if "name" in info and not state["contact"]["name"]:
+                    state["contact"]["name"] = info["name"]
 
-            # If caller explicitly asked for follow-up, allow contact request
-            if re.search(r"\b(email|send|share)\b.*\b(info|details|pricing|pilot|follow\s*up)\b", fixed, re.I):
-                state["allow_contact_request"] = True
+                # If caller explicitly asked for follow-up, allow contact request
+                if re.search(r"\b(email|send|share)\b.*\b(info|details|pricing|pilot|follow\s*up)\b", fixed, re.I):
+                    state["allow_contact_request"] = True
 
-            # Barge if substantial and currently speaking
-            words = fixed.split()
-            nowt = time.time()
-            in_long_window = nowt < state["long_answer_until"]
-            should_barge = len(words) >= (5 if in_long_window else 3)
-            if should_barge and state.get("barge_in_enabled") and state["speaking"] and speak_task and not speak_task.done():
-                speak_task.cancel()
-                try:
-                    await speak_task
-                except asyncio.CancelledError:
-                    pass
-
-
-            if looks_like_what_is_neuromed(fixed):
-                # If we're still in a greeting or mid-utterance, barge it now so we can respond immediately
-                if state.get("speaking") and speak_task and not speak_task.done():
+                # Barge if substantial and currently speaking
+                words = fixed.split()
+                nowt = time.time()
+                in_long_window = nowt < state["long_answer_until"]
+                should_barge = len(words) >= (5 if in_long_window else 3)
+                if should_barge and state.get("barge_in_enabled") and state["speaking"] and speak_task and not speak_task.done():
                     speak_task.cancel()
                     try:
                         await speak_task
                     except asyncio.CancelledError:
                         pass
 
-                # Say something instantly while we fetch the FAQ text (sub-200ms)
-                asyncio.create_task(speak("Sure—"))
+                # Universal "what is / tell me more / how does it work" fast-path
+                if re.search(r"\b(what\s+is|what'?s|tell\s+me\s+more|how\s+does\s+it\s+work)\b", fixed, re.I):
+                    asyncio.create_task(speak("Sure—"))
+                    answer = await call_faq("what_is_neuromed") or WHAT_IS_FALLBACK
+                    state["long_answer_until"] = time.time() + 2.0
+                    sentences = [s for s in re.split(r'(?<=[.!?])\s+', answer.strip()) if s]
+                    await speak_lines(sentences, greeted_already=state["greeted"], allow_contact_request=state["allow_contact_request"])
+                    return
 
-                # Try FAQ first; fall back to local copy if endpoint is slow or cold-starting
-                answer = await call_faq("what_is_neuromed")
-                if not answer:
-                    answer = WHAT_IS_FALLBACK
-
-                state["long_answer_until"] = time.time() + 2.0
-                sentences = [s for s in re.split(r'(?<=[.!?])\s+', (answer or "").strip()) if s]
-
-                await speak_lines(
-                    sentences,
-                    greeted_already=state["greeted"],
-                    allow_contact_request=state["allow_contact_request"]
-                )
-                return
-
-
-
-            # Normal: add to history
-            history.append({"role": "user", "content": fixed})
-
-            # Quick ack for short turns
-            if len(words) <= 6:
-                asyncio.create_task(quick_ack())
-
-            # Plan or generative
-            state["long_answer_until"] = time.time() + 2.0
-            try:
-                plan = await plan_reply(history, state=state)
-            except Exception as e:
-                print("PLAN ERROR ▶", repr(e))
-                plan = []
-
-            if plan:
-                await speak_lines(
-                    plan,
-                    greeted_already=state["greeted"],
-                    allow_contact_request=state["allow_contact_request"]
-                )
-            else:
-                gen_messages = [{"role":"system","content": SYSTEM_PROMPT}, *FEWSHOTS, *history]
-
-                spoke_count = 0
-                async def nudge():
-                    # If model is slow to produce the first sentence, say *something* so it never feels dead.
-                    await asyncio.sleep(1.2)
-                    if spoke_count == 0:
-                        await speak("Okay—")  # micro-ack while the first sentence finishes
-
-                nudge_task = asyncio.create_task(nudge())
-
-                async for sentence in stream_llm_sentences(gen_messages):
-                    said = await speak_lines(
-                        [sentence],
-                        greeted_already=state["greeted"],
-                        allow_contact_request=state["allow_contact_request"]
-                    )
-                    if said > 0:
-                        spoke_count += said
-                        if not nudge_task.done():
-                            nudge_task.cancel()
-
-                if spoke_count == 0:
-                    # Extreme fallback (should rarely happen)
+                # Brand-specific fast-path (kept; often redundant with universal path)
+                if looks_like_what_is_neuromed(fixed):
+                    asyncio.create_task(speak("Sure—"))
+                    answer = await call_faq("what_is_neuromed") or WHAT_IS_FALLBACK
+                    state["long_answer_until"] = time.time() + 2.0
+                    sentences = [s for s in re.split(r'(?<=[.!?])\s+', (answer or "").strip()) if s]
                     await speak_lines(
-                        ["Okay—would you like an overview, pricing, or to get started with a quick demo?"],
+                        sentences,
                         greeted_already=state["greeted"],
                         allow_contact_request=state["allow_contact_request"]
                     )
+                    return
 
+                # Normal: add to history
+                history.append({"role": "user", "content": fixed})
+
+                # Quick ack for short turns
+                if len(words) <= 6:
+                    asyncio.create_task(asyncio.sleep(0))  # yield once
+                    asyncio.create_task(speak("Okay—"))
+
+                # Plan or generative
+                state["long_answer_until"] = time.time() + 2.0
+                try:
+                    plan = await plan_reply(history, state=state)
+                except Exception as e:
+                    print("PLAN ERROR ▶", repr(e))
+                    plan = []
+
+                if plan:
+                    await speak_lines(
+                        plan,
+                        greeted_already=state["greeted"],
+                        allow_contact_request=state["allow_contact_request"]
+                    )
+                else:
+                    gen_messages = [{"role":"system","content": SYSTEM_PROMPT}, *FEWSHOTS, *history]
+
+                    spoke_count = 0
+                    async def nudge():
+                        # If model is slow to produce the first sentence, say *something* so it never feels dead.
+                        await asyncio.sleep(1.2)
+                        if spoke_count == 0:
+                            await speak("Okay—")  # micro-ack while the first sentence finishes
+
+                    nudge_task = asyncio.create_task(nudge())
+
+                    try:
+                        async for sentence in stream_llm_sentences(gen_messages):
+                            said = await speak_lines(
+                                [sentence],
+                                greeted_already=state["greeted"],
+                                allow_contact_request=state["allow_contact_request"]
+                            )
+                            if said > 0:
+                                spoke_count += said
+                                if not nudge_task.done():
+                                    nudge_task.cancel()
+                    except Exception as e:
+                        print("GEN ERROR ▶", repr(e))
+
+                    if spoke_count == 0:
+                        # Extreme fallback (should rarely happen)
+                        await speak_lines(
+                            ["Okay—would you like an overview, pricing, or to get started with a quick demo?"],
+                            greeted_already=state["greeted"],
+                            allow_contact_request=state["allow_contact_request"]
+                        )
+            except Exception as e:
+                print("PROCESS ERROR ▶", repr(e))
+                # Last-resort audible fallback
+                await speak("Okay—would you like an overview, pricing, or a quick demo?")
 
         async for utter, is_final in deepgram_stream(pcm_iter):
             if not utter:
@@ -838,16 +821,6 @@ async def handle_twilio(ws):
             if utter == last_user_sent:
                 continue
             last_user_sent = utter
-
-            # Ignore tiny backchannels while bot is speaking
-# If we're still speaking (e.g., greeting), hard-barge so we can respond now.
-            if state.get("speaking") and speak_task and not speak_task.done():
-                speak_task.cancel()
-                try:
-                    await speak_task
-                except asyncio.CancelledError:
-                    pass
-
 
             # Flush stale pending final if it sat too long
             now = time.time()
@@ -906,9 +879,8 @@ async def handle_twilio(ws):
                 if media_stats["frames"] == 1:
                     first_media.set()
                     print("WS ▶ first media frame received")
-                    # Let greeting start for ~1.2s before allowing interruptions
+                    # Allow barge-in sooner so callers can interrupt greeting
                     asyncio.create_task(arm_barge_in_after(0.6))
-
 
                 if media_stats["frames"] % 25 == 0:
                     print(f"WS ▶ media frames={media_stats['frames']} bytes={media_stats['bytes']}")
@@ -919,12 +891,10 @@ async def handle_twilio(ws):
                 if ECHO_BACK and stream_sid and conn_open:
                     await send_pcm(buf)
 
-
-
             elif ev == "stop":
                 print("WS ▶ stop")
+                # Mark closed and cancel any in-flight TTS so it doesn't try to send after close
                 conn_open = False
-                # Cancel any in-flight TTS so it doesn't try to send after close
                 if speak_task and not speak_task.done():
                     speak_task.cancel()
                     try:
@@ -933,13 +903,11 @@ async def handle_twilio(ws):
                         pass
                 break
 
-
     except Exception as e:
         print("WS ERR ▶", e)
     finally:
         conn_open = False
         await inbound_q.put(None)
-        # Also cancel any lingering speak task to avoid "Task exception was never retrieved"
         if speak_task and not speak_task.done():
             speak_task.cancel()
             try:
@@ -948,7 +916,6 @@ async def handle_twilio(ws):
                 pass
         await brain_task
         print("WS ▶ closed")
-
 
 async def main():
     # Quick env prints
@@ -963,7 +930,7 @@ async def main():
     async with websockets.serve(
         handle_twilio,
         "0.0.0.0",
-        PORT,                       # ← bind to Railway-assigned port
+        PORT,
         max_size=2**20,
         ping_interval=20,
         ping_timeout=60,
