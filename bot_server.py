@@ -1,5 +1,7 @@
 import os, json, base64, asyncio, websockets, httpx, re, time, random
 from dotenv import load_dotenv
+import difflib
+
 
 # Load envs next to this file (same folder as manage.py)
 load_dotenv()
@@ -67,6 +69,100 @@ WHAT_IS_FALLBACK = (
   "It’s built to help families, caregivers, and clinics find clarity quickly without medical advice."
 )
 
+
+# --- Robust brand detection (token-scored, no big alias list) ---
+NEURO_CORE = "neuromed"
+NEURO_AI   = "neuromed ai"
+
+# lightweight normalizer for ASR text
+def _soft_norm(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)           # drop punctuation
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+# collapse obvious ASR splits e.g. "a i" -> "ai", "e i" -> "ai"
+def _collapse_ai_runs(s: str) -> str:
+    s = re.sub(r"\b(a|e)\s*i\b", "ai", s)        # "a i" / "e i" -> "ai"
+    s = re.sub(r"\b(ay|eye)\b", "ai", s)         # homophones
+    return s
+
+# token-level confusion reductions
+def _confuse_token(tok: str) -> str:
+    # common ASR swaps + vowel squish
+    tok = tok.replace("nero", "neuro")
+    tok = tok.replace("neero", "neuro")
+    tok = tok.replace("nuro", "neuro")
+    tok = tok.replace("neural", "neuro")
+    tok = tok.replace("miura", "mira")
+    tok = tok.replace("mediate", "media")        # often over-ends in 'mediate'
+    tok = tok.replace("media", "med")            # pull toward 'med'
+    tok = tok.replace("maid", "med")             # maid ~ med
+    tok = tok.replace("met", "med")              # d/t
+    tok = tok.replace("mad", "med")              # a/e
+    tok = tok.replace("mid", "med")              # i/e
+    tok = tok.replace("medd", "med")
+    tok = tok.replace("mayd", "med")
+    return tok
+
+def _token_score(tok: str, targets: list[str]) -> int:
+    """
+    2 = strong match (exact or difflib >= .8 after confusion)
+    1 = weak match (difflib >= .6 after confusion)
+    0 = otherwise
+    """
+    t = _confuse_token(tok)
+    for target in targets:
+        if t == target:
+            return 2
+        if difflib.SequenceMatcher(None, t, target).ratio() >= 0.8:
+            return 2
+        if difflib.SequenceMatcher(None, t, target).ratio() >= 0.6:
+            return 1
+    return 0
+
+def _looks_like_brand(s: str) -> dict:
+    """
+    Heuristic: if we see a NEURO-ish token and a MED-ish token
+    within 0–2 tokens of each other, we treat it as 'NeuroMed'.
+    If we also see AI-ish at tail, treat as 'NeuroMed AI'.
+    Returns {'is_brand': bool, 'has_ai': bool}
+    """
+    s0 = _collapse_ai_runs(_soft_norm(s))
+    toks = s0.split()
+
+    neuro_like = {"neuro","nero","neero","nuro","neuromed","neuro-med","neural"}
+    med_like   = {"med","met","mid","mad","mira","miura","miramed","mira-med","miuramed"}
+    ai_like    = {"ai","a.i","a.i.","ay","eye"}
+
+    # scan windows
+    idxs_neuro = []
+    idxs_med   = []
+    idxs_ai    = []
+
+    for i, tok in enumerate(toks):
+        if _token_score(tok, list(neuro_like)) >= 1:
+            idxs_neuro.append(i)
+        if _token_score(tok, list(med_like)) >= 1:
+            idxs_med.append(i)
+        if tok in ai_like or _token_score(tok, ["ai"]) >= 1:
+            idxs_ai.append(i)
+
+    # need neuro+med within distance <=2 (order agnostic)
+    has_brand = any(abs(i - j) <= 2 for i in idxs_neuro for j in idxs_med)
+    # ai often appears at or near the tail
+    has_ai    = has_brand and (bool(idxs_ai) or s0.endswith(" ai"))
+
+    # extra fuzzy fallback: whole-string similarity
+    if not has_brand:
+        sim_nm  = difflib.SequenceMatcher(None, s0, NEURO_CORE).ratio()
+        sim_nma = difflib.SequenceMatcher(None, s0, NEURO_AI).ratio()
+        if sim_nm >= 0.62 or sim_nma >= 0.58:
+            has_brand = True
+            has_ai = has_ai or (sim_nma > sim_nm)
+
+    return {"is_brand": has_brand, "has_ai": has_ai}
+
 # --------- helpers ---------
 def b64_to_bytes(s: str) -> bytes:
     return base64.b64decode(s)
@@ -90,19 +186,48 @@ async def send_silence(ws_send_pcm, ms: int):
         # Connection closed mid-silence; safe to ignore
         pass
 
+FILLERS_RE = re.compile(r"^(?:\s*(?:yeah|yep|uh|um|hmm|hello|hi|hey|okay|ok)[,.\s]*)+", re.I)
+
+def _strip_fillers(s: str) -> str:
+    return FILLERS_RE.sub("", (s or "").strip()).strip()
+
+_NEURO_ALIASES = [
+    "neuro med", "neuromed", "neuro med ai", "neuro ai", "neuro media", "neuro mediate",
+    "miura med", "mira med", "miramad", "miuramed", "miu rammed", "neuro mid", "neuro maid",
+    "mid ai", "med ai", "my ai", "your ai", "media i", "mid a i"
+]
+
+def _brandify_tail(s: str) -> str:
+    # If the tail sounds like our brand, rewrite to canonical “NeuroMed AI”
+    tokens = s.lower().split()
+    tail = " ".join(tokens[-3:]) if tokens else ""
+    for alias in _NEURO_ALIASES:
+        if difflib.SequenceMatcher(None, tail, alias).ratio() >= 0.7:
+            return re.sub(r"(\b" + re.escape(tail) + r"\b)$", "NeuroMed AI", s, flags=re.I)
+    return s
+
+
 # --------- domain correction for common mishears ---------
 def domain_corrections(text: str) -> str:
     t = (text or "").strip()
+
+    # NEW: strip greeting fillers like "Yeah, hello, okay..."
+    t = _strip_fillers(t)
 
     # Common brand/name mishears → "NeuroMed" / "NeuroMed AI"
     subs = [
         (r"\bmiu?ra?med\b", "NeuroMed"),
         (r"\bmira\s*med\b", "NeuroMed"),
+        (r"\bmiura\s*med\b", "NeuroMed"),            # NEW
         (r"\bneuro\s*med\b", "NeuroMed"),
+        (r"\bneuro\s*mid\b", "NeuroMed"),
         (r"\bneuro\s*mediate\b", "NeuroMed AI"),
         (r"\bneuro\s*media(te)?\b", "NeuroMed AI"),
-        (r"\bneuro\s*mid\b", "NeuroMed"),
-        (r"\bneuro\s*med(ai| a[i1])\b", "NeuroMed AI"),
+        (r"\bneuro\s*med\s*(?:ai|a\s*i|a[i1])\b", "NeuroMed AI"),  # broadened
+        (r"\b(?:mid|med)\s*a\s*i\b", "NeuroMed AI"),               # NEW
+        (r"\bmedia\s*i\b", "NeuroMed AI"),                         # NEW
+        (r"\bmy\s*ai\b", "NeuroMed AI"),                           # NEW
+        (r"\byour\s+(?:ai|app|system)\b", "NeuroMed AI"),          # NEW
     ]
     for pat, repl in subs:
         t = re.sub(pat, repl, t, flags=re.I)
@@ -116,21 +241,22 @@ def domain_corrections(text: str) -> str:
     t = re.sub(r"\bA\.?I\.?\??$", "NeuroMed AI?", t, flags=re.I)
     t = re.sub(r"\bEA\??$",      "NeuroMed AI?", t, flags=re.I)
 
-    # “your …” trailing → normalize to brand
+    # “your …” trailing → normalize to brand (kept)
     if re.search(r"\byour\s+(?:ai|app|system)?\s*\??$", t, flags=re.I):
         t = re.sub(r"\byour\s+(?:ai|app|system)?\s*\??$", "NeuroMed AI?", t, flags=re.I)
 
+    # NEW: fuzzy tail fix (“mid a I / media i / my ai”) → “NeuroMed AI”
+    t = _brandify_tail(t)
+
     return t
 
+
 def looks_like_what_is_neuromed(s: str) -> bool:
-    q = re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower())
-    if ("what is" in q) or ("what s" in q) or ("what's" in q) or ("tell me more" in q):
-        keywords = [
-            "neuromed", "neuro med", "mira med", "miramad", "miuramed",
-            "neuro mediate", "neuro media", "neuro med ai", "neuro ai", "med ai"
-        ]
-        return any(k in q for k in keywords)
+    q = (s or "")
+    if re.search(r"\b(what\s+is|what'?s|tell\s+me\s+more|how\s+does\s+it\s+work)\b", q, re.I):
+        return _looks_like_brand(q)["is_brand"]
     return False
+
 
 # --------- Deepgram ASR (ws) ---------
 async def deepgram_stream(pcm_iter):
@@ -162,7 +288,12 @@ async def deepgram_stream(pcm_iter):
         try:
             await dg.send(json.dumps({
                 "type": "Configure",
-                "keywords": ["NeuroMed", "NeuroMed AI", "HIPAA", "pilot", "pricing", "faith"]
+                "keywords": [
+                "NeuroMed", "NeuroMed AI", "HIPAA", "pilot", "pricing", "faith",
+                "neuro med", "neuro mid", "neuro media", "neuro mediate",
+                "mira med", "miura med", "miuramed",
+                "med ai", "mid ai", "a i", "ay", "eye", "media i"
+                ]
             }))
         except Exception as e:
             print("DG CONFIG WARN ▶", repr(e))
@@ -708,6 +839,16 @@ async def handle_twilio(ws):
                     return
                 print("ROUTER ▶", fixed)
 
+                brand = _looks_like_brand(fixed)
+                if re.search(r"\b(what\s+is|what'?s|tell\s+me\s+more|how\s+does\s+it\s+work)\b", fixed, re.I) and brand["is_brand"]:
+                    asyncio.create_task(speak("Sure—"))
+                    answer = await call_faq("what_is_neuromed") or WHAT_IS_FALLBACK
+                    state["long_answer_until"] = time.time() + 2.0
+                    sentences = [s for s in re.split(r'(?<=[.!?])\s+', answer.strip()) if s]
+                    await speak_lines(sentences, greeted_already=state["greeted"], allow_contact_request=state["allow_contact_request"])
+                    return
+
+
                 # Opportunistic contact extraction
                 info = extract_contact_inline(fixed)
                 if "email" in info:
@@ -816,6 +957,7 @@ async def handle_twilio(ws):
         async for utter, is_final in deepgram_stream(pcm_iter):
             if not utter:
                 continue
+            utter = domain_corrections(utter)  
 
             # De-dupe identical emissions
             if utter == last_user_sent:
