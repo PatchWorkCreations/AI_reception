@@ -207,6 +207,45 @@ def _brandify_tail(s: str) -> str:
     return s
 
 
+# --- Deterministic keyword intents (broad coverage) ---
+def RX(p): return re.compile(p, re.I)
+
+HIPAA_RE = RX(r"\b(hipaa|hippa|hipa|phi|privacy|private|confidential|secure(?:d|ly)?|security|data\s+safe|data\s+protect(?:ed|ion)|encrypt(?:ed|ion|ing)?|compliance|compliant|gdpr|safeguard(?:s)?)\b")
+PRICING_RE = RX(r"\b(price|pricing|cost|how\s+(?:much|many)|rate|rates|quote|quotation|fees?|charges?|billing|ballpark|estimate|plan(?:s)?|tier(?:s)?)\b")
+PILOT_RE   = RX(r"\b(pilot|trial|try|evaluate|evaluation|proof\s+of\s+concept|poc|demo|walkthrough|test\s*drive|sandbox|kick\s*the\s+tires)\b")
+FAITH_RE   = RX(r"\b(faith|bible|scripture|psalm|verse|christ|jesus|prayer|chaplain|spiritual|encourag(?:e|ement)|devotional|religio(?:us|n))\b")
+LANG_RE    = RX(r"\b(multilingual|multi[-\s]?language|bilingual|translate|translation|spanish|tagalog|filipino|language\s+support|foreign\s+language)\b")
+SCHED_RE   = RX(r"\b(schedule|book|set\s*(?:up)?\s*(?:a\s*)?(?:call|meeting|appt|appointment)|calendar|availability|reschedul(?:e|ing)|confirm\s+(?:time|meeting)|follow[-\s]?up\s+call)\b")
+HUMAN_RE   = RX(r"\b(human|agent|representative|somebody|someone)\b|\b(speak|talk)\s+to\s+(a|the)\s+(human|person|agent)\b")
+INTEG_RE   = RX(r"\b(ehr|emr|hl7|fhir|api|integrat(?:e|ion)|sso|okta|azure\s+ad|oauth|epic|cerner|meditech|athenahealth|allscripts)\b")
+SUPPORT_RE = RX(r"\b(help|support|troubleshoot|issue|error|bug|broken|not\s+working|can'?t\s+(?:login|log\s*in|sign\s*in)|password\s+reset|freeze|lag|timeout|down|glitch)\b")
+ADDRESS_RE = RX(r"\b(address|where\s+are\s+you|location|office|hq|headquarters)\b")
+HOURS_RE   = RX(r"\b(hours?|open|close|availability|available\s+when)\b")
+
+YES_RE = RX(r"^(?:yes|yeah|yep|sure|correct|right|ok(?:ay)?)\.?$")
+NO_RE  = RX(r"^(?:no|nope|nah|negative|not\s+really)\.?$")
+
+def classify_intent_by_keywords(s: str) -> str:
+    """
+    Map to planner intents you already handle: hipaa, pricing, faith_mode, pilot, hours, address, other.
+    Plus special: multilingual, scheduling, human, integration, support.
+    """
+    txt = (s or "")
+    if HIPAA_RE.search(txt):   return "hipaa"
+    if PRICING_RE.search(txt): return "pricing"
+    if FAITH_RE.search(txt):   return "faith_mode"
+    if PILOT_RE.search(txt):   return "pilot"
+    if SCHED_RE.search(txt):   return "scheduling"
+    if LANG_RE.search(txt):    return "multilingual"
+    if HUMAN_RE.search(txt):   return "human"
+    if INTEG_RE.search(txt):   return "integration"
+    if SUPPORT_RE.search(txt): return "support"
+    if ADDRESS_RE.search(txt): return "address"
+    if HOURS_RE.search(txt):   return "hours"
+    return "other"
+
+
+
 # --------- domain correction for common mishears ---------
 def domain_corrections(text: str) -> str:
     t = (text or "").strip()
@@ -240,6 +279,10 @@ def domain_corrections(text: str) -> str:
     t = re.sub(r"\bE\.?A\.?\??$", "NeuroMed AI?", t, flags=re.I)
     t = re.sub(r"\bA\.?I\.?\??$", "NeuroMed AI?", t, flags=re.I)
     t = re.sub(r"\bEA\??$",      "NeuroMed AI?", t, flags=re.I)
+    t = re.sub(r"\bare you on security\b", "is it secure", t, flags=re.I)
+    t = re.sub(r"\bis it secured\b", "is it secure", t, flags=re.I)
+    t = re.sub(r"\bis (?:your|the)\s+data\s+(?:safe|secured?)\b", "is it secure", t, flags=re.I)
+    t = re.sub(r"\bis it (?:hipa|hippa)\b", "is it hipaa", t, flags=re.I)
 
     # “your …” trailing → normalize to brand (kept)
     if re.search(r"\byour\s+(?:ai|app|system)?\s*\??$", t, flags=re.I):
@@ -289,11 +332,16 @@ async def deepgram_stream(pcm_iter):
             await dg.send(json.dumps({
                 "type": "Configure",
                 "keywords": [
-                "NeuroMed", "NeuroMed AI", "HIPAA", "pilot", "pricing", "faith",
+                "NeuroMed", "NeuroMed AI",
+                "HIPAA", "privacy", "private", "secure", "secured", "security",
+                "encrypted", "encryption", "compliance", "compliant", "GDPR", "PHI",
+                "pricing", "pilot", "demo", "faith",
+                "schedule", "appointment", "Spanish", "Tagalog",
                 "neuro med", "neuro mid", "neuro media", "neuro mediate",
                 "mira med", "miura med", "miuramed",
                 "med ai", "mid ai", "a i", "ay", "eye", "media i"
                 ]
+
             }))
         except Exception as e:
             print("DG CONFIG WARN ▶", repr(e))
@@ -665,6 +713,10 @@ async def handle_twilio(ws):
         "local_no_barge_until": 0.0, # per-utterance grace while starting TTS
         "allow_contact_request": False,
         "contact": {"name": None, "email": None},
+        "last_intent": "other",
+        "last_intent_ts": 0.0,
+        "last_question": None,          # "yn" | "open" | None
+        "TOPIC_STICKY_SECS": 10.0,  
     }
 
     # connection flag + safe media sender
@@ -839,17 +891,158 @@ async def handle_twilio(ws):
                     return
                 print("ROUTER ▶", fixed)
 
+                # ------------------- 0) Keyword-first routing + stickiness + yes/no -------------------
+                nowt = time.time()
+                kw_intent = classify_intent_by_keywords(fixed)
+
+                # short echoes like "Security. Yeah." should stick to recent topic
+                if kw_intent == "other" and (state.get("last_intent") not in (None, "other")):
+                    if len(fixed.split()) <= 3 and (nowt - state.get("last_intent_ts", 0)) < state.get("TOPIC_STICKY_SECS", 10.0):
+                        kw_intent = state["last_intent"]
+
+                # yes/no follow-ups
+                yn = None
+                if YES_RE.match(fixed.strip()):
+                    yn = "yes"
+                elif NO_RE.match(fixed.strip()):
+                    yn = "no"
+
+                # If last question was Y/N and caller said yes/no, reuse last_intent
+                if yn and state.get("last_question") == "yn" and state.get("last_intent") not in (None, "other"):
+                    kw_intent = state["last_intent"]
+
+                # remember chosen intent (if any)
+                if kw_intent != "other":
+                    state["last_intent"] = kw_intent
+                    state["last_intent_ts"] = nowt
+
+                    # ---- Instant responses for common intents (low latency, no LLM) ----
+                    if kw_intent == "hipaa":
+                        state["last_question"] = "open"
+                        await speak_lines(
+                            ["Your files are kept private and secure, and we don’t share your data with anyone."],
+                            greeted_already=state["greeted"],
+                            allow_contact_request=state["allow_contact_request"]
+                        )
+                        return
+
+                    if kw_intent == "pricing":
+                        state["last_question"] = "yn"
+                        await speak_lines(
+                            ["We offer options for families, caregivers, and facilities. I can send a quick overview—what’s the best email to use?"],
+                            greeted_already=state["greeted"],
+                            allow_contact_request=True
+                        )
+                        return
+
+                    if kw_intent == "faith_mode":
+                        state["last_question"] = "open"
+                        await speak_lines(
+                            ["Yes—there’s a mode with encouragement and Scripture for those who want hope alongside clarity."],
+                            greeted_already=state["greeted"],
+                            allow_contact_request=state["allow_contact_request"]
+                        )
+                        return
+
+                    if kw_intent == "pilot":
+                        state["last_question"] = "yn"
+                        await speak_lines(
+                            ["We do pilot programs with nursing homes, clinics, and community groups. I can email details—what email should we use?"],
+                            greeted_already=state["greeted"],
+                            allow_contact_request=True
+                        )
+                        return
+
+                    if kw_intent == "multilingual":
+                        state["last_question"] = "open"
+                        await speak_lines(
+                            ["We can provide summaries in multiple languages—for families who need clarity in their heart language."],
+                            greeted_already=state["greeted"],
+                            allow_contact_request=state["allow_contact_request"]
+                        )
+                        return
+
+                    if kw_intent == "scheduling":
+                        state["last_question"] = "open"
+                        await speak_lines(
+                            ["We’re available on weekdays. If you share your time zone, I can suggest a slot."],
+                            greeted_already=state["greeted"],
+                            allow_contact_request=state["allow_contact_request"]
+                        )
+                        return
+
+                    if kw_intent == "human":
+                        state["last_question"] = "open"
+                        await speak_lines(
+                            ["I can collect your name and email so a teammate follows up shortly."],
+                            greeted_already=state["greeted"],
+                            allow_contact_request=True
+                        )
+                        return
+
+                    if kw_intent == "integration":
+                        state["last_question"] = "open"
+                        await speak_lines(
+                            ["We integrate with clinical systems like EHRs via standards like HL7 and FHIR."],
+                            greeted_already=state["greeted"],
+                            allow_contact_request=state["allow_contact_request"]
+                        )
+                        return
+
+                    if kw_intent == "support":
+                        state["last_question"] = "open"
+                        await speak_lines(
+                            ["I can help get you support—can I have your best email so we can follow up?"],
+                            greeted_already=state["greeted"],
+                            allow_contact_request=True
+                        )
+                        return
+
+                    if kw_intent == "address":
+                        state["last_question"] = "open"
+                        await speak_lines(
+                            ["We operate online and partner with facilities; if you share your city, I can route you."],
+                            greeted_already=state["greeted"],
+                            allow_contact_request=state["allow_contact_request"]
+                        )
+                        return
+
+                    if kw_intent == "hours":
+                        state["last_question"] = "open"
+                        await speak_lines(
+                            ["We’re available weekdays."],
+                            greeted_already=state["greeted"],
+                            allow_contact_request=state["allow_contact_request"]
+                        )
+                        return
+                # ------------------- 1) Brand / “what is” fast-path -------------------
                 brand = _looks_like_brand(fixed)
                 if re.search(r"\b(what\s+is|what'?s|tell\s+me\s+more|how\s+does\s+it\s+work)\b", fixed, re.I) and brand["is_brand"]:
                     asyncio.create_task(speak("Sure—"))
                     answer = await call_faq("what_is_neuromed") or WHAT_IS_FALLBACK
                     state["long_answer_until"] = time.time() + 2.0
                     sentences = [s for s in re.split(r'(?<=[.!?])\s+', answer.strip()) if s]
-                    await speak_lines(sentences, greeted_already=state["greeted"], allow_contact_request=state["allow_contact_request"])
+                    await speak_lines(
+                        sentences,
+                        greeted_already=state["greeted"],
+                        allow_contact_request=state["allow_contact_request"]
+                    )
                     return
 
+                # Also catch generic "what is / tell me more" even if brand wasn’t detected
+                if re.search(r"\b(what\s+is|what'?s|tell\s+me\s+more|how\s+does\s+it\s+work)\b", fixed, re.I):
+                    asyncio.create_task(speak("Sure—"))
+                    answer = await call_faq("what_is_neuromed") or WHAT_IS_FALLBACK
+                    state["long_answer_until"] = time.time() + 2.0
+                    sentences = [s for s in re.split(r'(?<=[.!?])\s+', answer.strip()) if s]
+                    await speak_lines(
+                        sentences,
+                        greeted_already=state["greeted"],
+                        allow_contact_request=state["allow_contact_request"]
+                    )
+                    return
 
-                # Opportunistic contact extraction
+                # ------------------- 2) Opportunistic contact extraction -------------------
                 info = extract_contact_inline(fixed)
                 if "email" in info:
                     state["contact"]["email"] = info["email"]
@@ -860,9 +1053,8 @@ async def handle_twilio(ws):
                 if re.search(r"\b(email|send|share)\b.*\b(info|details|pricing|pilot|follow\s*up)\b", fixed, re.I):
                     state["allow_contact_request"] = True
 
-                # Barge if substantial and currently speaking
+                # ------------------- 3) Barge-in if substantial while we’re speaking -------------------
                 words = fixed.split()
-                nowt = time.time()
                 in_long_window = nowt < state["long_answer_until"]
                 should_barge = len(words) >= (5 if in_long_window else 3)
                 if should_barge and state.get("barge_in_enabled") and state["speaking"] and speak_task and not speak_task.done():
@@ -872,29 +1064,7 @@ async def handle_twilio(ws):
                     except asyncio.CancelledError:
                         pass
 
-                # Universal "what is / tell me more / how does it work" fast-path
-                if re.search(r"\b(what\s+is|what'?s|tell\s+me\s+more|how\s+does\s+it\s+work)\b", fixed, re.I):
-                    asyncio.create_task(speak("Sure—"))
-                    answer = await call_faq("what_is_neuromed") or WHAT_IS_FALLBACK
-                    state["long_answer_until"] = time.time() + 2.0
-                    sentences = [s for s in re.split(r'(?<=[.!?])\s+', answer.strip()) if s]
-                    await speak_lines(sentences, greeted_already=state["greeted"], allow_contact_request=state["allow_contact_request"])
-                    return
-
-                # Brand-specific fast-path (kept; often redundant with universal path)
-                if looks_like_what_is_neuromed(fixed):
-                    asyncio.create_task(speak("Sure—"))
-                    answer = await call_faq("what_is_neuromed") or WHAT_IS_FALLBACK
-                    state["long_answer_until"] = time.time() + 2.0
-                    sentences = [s for s in re.split(r'(?<=[.!?])\s+', (answer or "").strip()) if s]
-                    await speak_lines(
-                        sentences,
-                        greeted_already=state["greeted"],
-                        allow_contact_request=state["allow_contact_request"]
-                    )
-                    return
-
-                # Normal: add to history
+                # ------------------- 4) Normal flow: history -> planner -> (LLM stream) -------------------
                 history.append({"role": "user", "content": fixed})
 
                 # Quick ack for short turns
@@ -902,7 +1072,7 @@ async def handle_twilio(ws):
                     asyncio.create_task(asyncio.sleep(0))  # yield once
                     asyncio.create_task(speak("Okay—"))
 
-                # Plan or generative
+                # Planner or generative
                 state["long_answer_until"] = time.time() + 2.0
                 try:
                     plan = await plan_reply(history, state=state)
@@ -917,7 +1087,7 @@ async def handle_twilio(ws):
                         allow_contact_request=state["allow_contact_request"]
                     )
                 else:
-                    gen_messages = [{"role":"system","content": SYSTEM_PROMPT}, *FEWSHOTS, *history]
+                    gen_messages = [{"role": "system", "content": SYSTEM_PROMPT}, *FEWSHOTS, *history]
 
                     spoke_count = 0
                     async def nudge():
@@ -953,6 +1123,7 @@ async def handle_twilio(ws):
                 print("PROCESS ERROR ▶", repr(e))
                 # Last-resort audible fallback
                 await speak("Okay—would you like an overview, pricing, or a quick demo?")
+
 
         async for utter, is_final in deepgram_stream(pcm_iter):
             if not utter:
