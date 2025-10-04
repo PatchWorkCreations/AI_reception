@@ -20,11 +20,6 @@ WELCOME_MENU = (
     "Which one sounds good to you today?"
 )
 
-# NEW: a shorter follow-up menu used after answering one question
-FOLLOWUP_MENU = (
-    "Anything else — overview, privacy, pricing, pilot programs, hours, or getting started?"
-)
-
 RESPONSES = {
     "overview": (
         "NeuroMed AI takes medical files — like discharge notes, lab results, and imaging reports — "
@@ -59,6 +54,7 @@ RESPONSES = {
     ),
 }
 
+
 # --------- Minimal, readable intent matching ---------
 RX = lambda p: re.compile(p, re.I)
 INTENTS = [
@@ -80,11 +76,6 @@ def classify_intent(text: str) -> str:
         if rx.search(t):
             return name
     return "fallback"
-
-# NEW: “end of conversation” detectors
-THANKS_OR_BYE_RE = RX(
-    r"\b(thanks|thank\s*you|that'?s\s*(all|it)|nothing\s*else|no,\s*that'?s\s*all|i'?m\s*good|we('?| )?re\s*good|bye|goodbye|have\s*a\s*nice\s*day)\b"
-)
 
 # --------- helpers ---------
 def b64_to_bytes(s: str) -> bytes:
@@ -256,7 +247,6 @@ async def handle_twilio(ws):
     stream_sid = None
     speak_task: asyncio.Task | None = None
     first_media = asyncio.Event()
-    session_done = False  # NEW: stop re-prompting after a “thanks/bye”
 
     async def pcm_iter():
         while True:
@@ -291,6 +281,7 @@ async def handle_twilio(ws):
             except asyncio.CancelledError: pass
 
         async def _run():
+            # tiny pre-breath for natural pacing
             pre = 50 + int(random.uniform(-10, 15))
             await send_silence(send_pcm, max(pre, 20))
             async for pcm in eleven_tts_stream_cached(text):
@@ -302,7 +293,6 @@ async def handle_twilio(ws):
         speak_task = asyncio.create_task(_run())
 
     async def brain():
-        nonlocal session_done
         if not DEEPGRAM_KEY:
             return
         try:
@@ -315,32 +305,14 @@ async def handle_twilio(ws):
         FINAL_DEBOUNCE = 0.3
 
         async def handle_user(text: str):
-            nonlocal session_done
-            if session_done:
-                return
-
-            t = (text or "").strip()
-            # If caller signals ending, say goodbye w/ website and stop re-prompting
-            if THANKS_OR_BYE_RE.search(t):
-                session_done = True
-                await speak("You're welcome. Visit neuromedai.org for more information. Take care.")
-                return
-
             # core: classify → fixed response
-            intent = classify_intent(t)
+            intent = classify_intent(text)
             print("INTENT ▶", intent)
             reply = RESPONSES.get(intent, RESPONSES["fallback"])
             await speak(reply)
 
-            # After answering, circle back to the concise menu (unless session ended)
-            if not session_done:
-                # small natural pause before re-prompting
-                await asyncio.sleep(0.25)
-                await speak(FOLLOWUP_MENU)
-
         async for utter, is_final in deepgram_stream(pcm_iter):
-            if not utter or session_done:
-                continue
+            if not utter: continue
             now = time.time()
 
             if is_final:
@@ -355,7 +327,7 @@ async def handle_twilio(ws):
                     await handle_user(pending_final)
                     pending_final = None
 
-        if pending_final and not session_done:
+        if pending_final:
             await handle_user(pending_final)
 
     brain_task = asyncio.create_task(brain())
@@ -369,6 +341,7 @@ async def handle_twilio(ws):
                 start_info = data.get("start", {}) or {}
                 stream_sid = start_info.get("streamSid")
                 print(f"WS ▶ start streamSid={stream_sid}")
+                # greet immediately with the short menu
                 asyncio.create_task(speak(WELCOME_MENU))
 
             elif ev == "media":
