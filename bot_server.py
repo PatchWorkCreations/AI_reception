@@ -155,99 +155,6 @@ async def eleven_tts_stream_cached(text: str):
         eleven_tts_stream_cached._mem = getattr(eleven_tts_stream_cached, "_mem", {})
         eleven_tts_stream_cached._mem[key] = chunks
 
-# --------- Deepgram ASR ---------
-async def deepgram_stream(pcm_iter):
-    if not DEEPGRAM_KEY:
-        print("ASR WARN ▶ DEEPGRAM_API_KEY missing; ASR disabled.")
-        return
-
-    url = (
-        "wss://api.deepgram.com/v1/listen"
-        "?model=nova-2"
-        "&encoding=mulaw"
-        "&sample_rate=8000"
-        "&language=en-US"
-        "&punctuate=true"
-        "&interim_results=true"
-        "&vad_events=true"
-        "&endpointing=true"
-        "&vad_turnoff=300"
-    )
-    headers = [("Authorization", f"Token {DEEPGRAM_KEY}")]
-
-    async with websockets.connect(url, extra_headers=headers, max_size=2**20) as dg:
-        # Light keyword biasing
-        try:
-            await dg.send(json.dumps({
-                "type": "Configure",
-                "keywords": [
-                    "NeuroMed", "HIPAA", "privacy", "pricing", "pilot", "demo",
-                    "hours", "appointment", "schedule", "caregiver", "faith"
-                ]
-            }))
-        except Exception as e:
-            print("DG CONFIG WARN ▶", repr(e))
-
-        async def feeder():
-            try:
-                async for chunk in pcm_iter():
-                    if chunk is None:
-                        break
-                    try:
-                        await dg.send(chunk)
-                    except (websockets.exceptions.ConnectionClosedOK,
-                            websockets.exceptions.ConnectionClosedError):
-                        break
-            finally:
-                try:
-                    await dg.send(json.dumps({"type": "CloseStream"}))
-                except Exception:
-                    pass
-
-        feed_task = asyncio.create_task(feeder())
-
-        last_sent = ""
-        last_emit = 0.0
-        try:
-            async for msg in dg:
-                try:
-                    obj = json.loads(msg)
-                except Exception:
-                    continue
-
-                if isinstance(obj, dict) and obj.get("type") in {
-                    "Metadata","Warning","Error","Close","UtteranceEnd","SpeechStarted","SpeechFinished"
-                }:
-                    continue
-
-                alts, is_final = [], bool(obj.get("is_final"))
-                chan = obj.get("channel")
-                if isinstance(chan, dict):
-                    alts = chan.get("alternatives") or []
-                elif isinstance(chan, list) and chan:
-                    first_chan = chan[0] or {}
-                    if isinstance(first_chan, dict):
-                        alts = first_chan.get("alternatives") or []
-                elif isinstance(obj, dict) and "alternatives" in obj:
-                    alts = obj.get("alternatives") or []
-
-                if not alts: continue
-                txt = (alts[0].get("transcript") or "").strip()
-                if not txt: continue
-
-                now = time.time()
-                if not (is_final or (now - last_emit) > 0.2):  # throttle partials
-                    continue
-                if not is_final and txt == last_sent:
-                    continue
-
-                print(f"ASR{'(final)' if is_final else ''} ▶ {txt}")
-                yield txt, is_final
-                last_emit = now
-                last_sent = txt
-        finally:
-            await feed_task
-
 # --------- Twilio WS Server (deterministic loop) ---------
 async def handle_twilio(ws):
     if ws.path not in ("/ws/twilio",):
@@ -284,7 +191,8 @@ async def handle_twilio(ws):
             conn_open = False
             return False
 
-    async def speak(text: str):
+    async def speak(text: str, *, allow_interrupt: bool = True):
+        """Speak text. If allow_interrupt is False and we're already speaking, skip."""
         nonlocal speak_task
         text = (text or "").strip()
         if not text:
@@ -293,7 +201,12 @@ async def handle_twilio(ws):
         # debug so we know we attempted to speak
         print("SPEAK ▶", text[:120].replace("\n"," "))
 
+        # If someone is already speaking:
         if speak_task and not speak_task.done():
+            if not allow_interrupt:
+                # low-priority utterance; don't cut off current speech
+                return
+            # Otherwise, interrupt current speech
             speak_task.cancel()
             try:
                 await speak_task
@@ -301,15 +214,21 @@ async def handle_twilio(ws):
                 pass
 
         async def _run():
+            any_chunk = False
             # tiny pre-breath for natural pacing
             pre = 50 + int(random.uniform(-10, 15))
             await send_silence(send_pcm, max(pre, 20))
             async for pcm in eleven_tts_stream_cached(text):
+                any_chunk = True
                 ok = await send_pcm(pcm)
                 if not ok:
                     return
-            post = 50 + int(random.uniform(-10, 15))
-            await send_silence(send_pcm, max(post, 20))
+            # post pause only if we actually played audio
+            if any_chunk:
+                post = 50 + int(random.uniform(-10, 15))
+                await send_silence(send_pcm, max(post, 20))
+            else:
+                print("SPEAK WARN ▶ no audio chunks produced.")
 
         speak_task = asyncio.create_task(_run())
 
@@ -339,19 +258,16 @@ async def handle_twilio(ws):
                 await speak("You're welcome. Visit neuromedai.org for more information. Take care.")
                 return
 
-            # Immediate micro-ack for perceived snappiness
-            asyncio.create_task(speak("Okay—"))
-
             # classify → fixed response
             intent = classify_intent(t)
             print("INTENT ▶", intent)
             reply = RESPONSES.get(intent, RESPONSES["fallback"])
-            await speak(reply)
 
-            # After answering, circle back to the concise menu (unless session ended)
+            # Speak the answer fully, then follow-up menu
+            await speak(reply)  # main answer (interruptible by next user turn)
             if not session_done:
                 await asyncio.sleep(0.25)
-                await speak(FOLLOWUP_MENU)
+                await speak(FOLLOWUP_MENU, allow_interrupt=False)  # don't cut off the answer for the menu
 
         async for utter, is_final in deepgram_stream(pcm_iter):
             if not utter or session_done:
@@ -384,7 +300,8 @@ async def handle_twilio(ws):
                 start_info = data.get("start", {}) or {}
                 stream_sid = start_info.get("streamSid")
                 print(f"WS ▶ start streamSid={stream_sid}")
-                asyncio.create_task(speak(WELCOME_MENU))
+                # Greeting is important; don't let anything cut it off
+                await speak(WELCOME_MENU, allow_interrupt=False)
 
             elif ev == "media":
                 payload_b64 = data["media"]["payload"]
