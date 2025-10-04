@@ -20,7 +20,7 @@ WELCOME_MENU = (
     "Which one sounds good to you today?"
 )
 
-# NEW: a shorter follow-up menu used after answering one question
+# concise follow-up menu after each answer
 FOLLOWUP_MENU = (
     "Anything else — overview, privacy, pricing, pilot programs, hours, or getting started?"
 )
@@ -67,7 +67,8 @@ INTENTS = [
     ("pricing",  RX(r"\b(price|pricing|cost|how\s+much|rate|fees?|plans?|tiers?)\b")),
     ("pilot",    RX(r"\b(pilot|trial|poc|demo|evaluate|evaluation|test\s*drive)\b")),
     ("hours",    RX(r"\b(hours?|availability|available|open|close|schedule|book|appointment|appt)\b")),
-    ("start",    RX(r"\b(get\s*started|start|begin|sign\s*up|setup|set\s*up)\b")),
+    # expanded to catch 'start', 'started', 'starting', 'get started', 'getting started', etc.
+    ("start",    RX(r"\b(get(?:ting)?\s*started|start(?:ed|ing)?|begin(?:ning)?|sign\s*up|signup|set\s*up|setup)\b")),
 ]
 
 FILLERS_RE = RX(r"^(?:\s*(?:yeah|yep|uh|um|hmm|hello|hi|hey|okay|ok)[,.\s]*)+")
@@ -76,12 +77,15 @@ def _strip_fillers(s: str) -> str:
 
 def classify_intent(text: str) -> str:
     t = _strip_fillers(text or "")
+    # extra nudge: if it clearly says (get)ting started or start(ed/ing), force start
+    if RX(r"\b(get(?:ting)?\s*started|start(?:ed|ing)?)\b").search(t):
+        return "start"
     for name, rx in INTENTS:
         if rx.search(t):
             return name
     return "fallback"
 
-# NEW: “end of conversation” detectors
+# Detect “thanks / bye / that’s all”
 THANKS_OR_BYE_RE = RX(
     r"\b(thanks|thank\s*you|that'?s\s*(all|it)|nothing\s*else|no,\s*that'?s\s*all|i'?m\s*good|we('?| )?re\s*good|bye|goodbye|have\s*a\s*nice\s*day)\b"
 )
@@ -256,7 +260,7 @@ async def handle_twilio(ws):
     stream_sid = None
     speak_task: asyncio.Task | None = None
     first_media = asyncio.Event()
-    session_done = False  # NEW: stop re-prompting after a “thanks/bye”
+    session_done = False  # stop re-prompting after a “thanks/bye”
 
     async def pcm_iter():
         while True:
@@ -283,19 +287,27 @@ async def handle_twilio(ws):
     async def speak(text: str):
         nonlocal speak_task
         text = (text or "").strip()
-        if not text: return
+        if not text:
+            return
+
+        # debug so we know we attempted to speak
+        print("SPEAK ▶", text[:120].replace("\n"," "))
 
         if speak_task and not speak_task.done():
             speak_task.cancel()
-            try: await speak_task
-            except asyncio.CancelledError: pass
+            try:
+                await speak_task
+            except asyncio.CancelledError:
+                pass
 
         async def _run():
+            # tiny pre-breath for natural pacing
             pre = 50 + int(random.uniform(-10, 15))
             await send_silence(send_pcm, max(pre, 20))
             async for pcm in eleven_tts_stream_cached(text):
                 ok = await send_pcm(pcm)
-                if not ok: return
+                if not ok:
+                    return
             post = 50 + int(random.uniform(-10, 15))
             await send_silence(send_pcm, max(post, 20))
 
@@ -320,13 +332,17 @@ async def handle_twilio(ws):
                 return
 
             t = (text or "").strip()
-            # If caller signals ending, say goodbye w/ website and stop re-prompting
+
+            # Goodbye intent → say website and stop re-prompting
             if THANKS_OR_BYE_RE.search(t):
                 session_done = True
                 await speak("You're welcome. Visit neuromedai.org for more information. Take care.")
                 return
 
-            # core: classify → fixed response
+            # Immediate micro-ack for perceived snappiness
+            asyncio.create_task(speak("Okay—"))
+
+            # classify → fixed response
             intent = classify_intent(t)
             print("INTENT ▶", intent)
             reply = RESPONSES.get(intent, RESPONSES["fallback"])
@@ -334,7 +350,6 @@ async def handle_twilio(ws):
 
             # After answering, circle back to the concise menu (unless session ended)
             if not session_done:
-                # small natural pause before re-prompting
                 await asyncio.sleep(0.25)
                 await speak(FOLLOWUP_MENU)
 
@@ -386,8 +401,10 @@ async def handle_twilio(ws):
                 conn_open = False
                 if speak_task and not speak_task.done():
                     speak_task.cancel()
-                    try: await speak_task
-                    except asyncio.CancelledError: pass
+                    try:
+                        await speak_task
+                    except asyncio.CancelledError:
+                        pass
                 break
 
     except Exception as e:
@@ -397,8 +414,10 @@ async def handle_twilio(ws):
         await inbound_q.put(None)
         if speak_task and not speak_task.done():
             speak_task.cancel()
-            try: await speak_task
-            except asyncio.CancelledError: pass
+            try:
+                await speak_task
+            except asyncio.CancelledError:
+                pass
         await brain_task
         print("WS ▶ closed")
 
