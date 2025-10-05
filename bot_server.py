@@ -17,7 +17,7 @@ ELEVEN_VOICE   = os.getenv("ELEVENLABS_VOICE_ID", "Bella")
 
 # OpenAI model + timeouts (fast + cheap)
 OPENAI_MODEL         = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_TIMEOUT_S     = float(os.getenv("OPENAI_TIMEOUT_S", "0.6"))  # safer than 0.35
+OPENAI_TIMEOUT_S     = float(os.getenv("OPENAI_TIMEOUT_S", "0.6"))
 OPENAI_ENABLE        = bool(OPENAI_API_KEY)
 
 # --------- Menu content ---------
@@ -67,7 +67,6 @@ RX = lambda p: re.compile(p, re.I)
 HELLO_RE   = RX(r"\b(hello|hi|hey|good\s*(morning|afternoon|evening)|yo)\b")
 THANKS_RE  = RX(r"\b(thanks?|thank\s*you|that'?s\s*all|nothing\s*else|i'?m\s*good|we'?re\s*good)\b")
 INTENT_NONE = RX(r"\b(none|finish|end|no(?:\s+thanks|\s+thank\s*you)?)\b")
-# phonetic "pilot"
 PILOT_PHONETIC = RX(r"\bp(?:y|i|ai|ee)?l(?:o|a)?t(?:\s+pro(?:g|gr|gram)?)?\b")
 
 # Primary patterns
@@ -388,9 +387,18 @@ def _word_numbers_to_digits(tokens):
 
 _SP_OK = {"at":"@", "dot":".", "period":".", "underscore":"_", "dash":"-", "hyphen":"-", "plus":"+"}
 
-# provider split fixes + common ASR endings
+# extra filler words we'll drop around addresses
+_EMAIL_FILLER = {
+    "my","email","mail","address","is","it's","its","this","the","to","send","reach","me","at:",
+    "and","please","you","can","use","on","for"
+}
+
+# provider split fixes + common variants
 _PROVIDER_FIXES = [
     (r"\bg\s*mail\b", "gmail"),
+    (r"\bgee\s*mail\b", "gmail"),
+    (r"\bg\s*male\b", "gmail"),
+    (r"\bgee\s*male\b", "gmail"),
     (r"\bout\s*look\b", "outlook"),
     (r"\bproton\s*mail\b", "protonmail"),
     (r"\bhot\s*mail\b", "hotmail"),
@@ -398,35 +406,66 @@ _PROVIDER_FIXES = [
     (r"\byahoo\b", "yahoo"),
 ]
 
-def normalize_spoken_email(text: str) -> str | None:
-    t = re.sub(r"[^\w\s@.+-]", " ", (text or "").lower())
+def _clean_tokens_for_email(toks):
+    # remove obvious filler around the address
+    return [t for t in toks if t not in _EMAIL_FILLER]
 
-    # collapse split providers BEFORE removing spaces
+def normalize_spoken_email(text: str) -> str | None:
+    """Robustly extract an email from messy speech text.
+       Returns first valid email if found, else None.
+    """
+    if not text:
+        return None
+
+    # lowercase, keep simple marks
+    t = re.sub(r"[^\w\s@.+-]", " ", text.lower())
+
+    # provider fixes BEFORE splitting/glue
     for pat, rep in _PROVIDER_FIXES:
         t = re.sub(pat, rep, t)
 
     toks = [w for w in t.split() if w]
     toks = _word_numbers_to_digits(toks)
-    mapped = [_SP_OK.get(w, w) for w in toks]
-    s = " ".join(mapped)
+    toks = [ _SP_OK.get(w, w) for w in toks ]
+    toks = _clean_tokens_for_email(toks)
+
+    s = " ".join(toks)
 
     # collapse around @ and .
     s = re.sub(r"\s*@\s*", "@", s)
     s = re.sub(r"\s*\.\s*", ".", s)
 
-    # remove residual spaces inside local/domain
+    # if we have an @, tighten local/domain spacing
     if "@" in s:
         local, _, domain = s.partition("@")
         local = re.sub(r"\s+", "", local)
         domain = re.sub(r"\s+", "", domain)
         s = f"{local}@{domain}"
 
-    # common ASR suffixes
+    # Common ASR fixes
     s = re.sub(r"\.come\b", ".com", s)
     s = re.sub(r"\.calm\b", ".com", s)
     s = re.sub(r"\.orgg\b", ".org", s)
+
     s = s.strip()
-    return s if EMAIL_RE.fullmatch(s or "") else None
+
+    # 1) accept clean, entire-string email
+    if EMAIL_RE.fullmatch(s or ""):
+        return s
+
+    # 2) otherwise, try to find an email anywhere in the normalized text
+    m = EMAIL_RE.search(s)
+    if m:
+        return m.group(0)
+
+    # 3) last chance: build candidates around an '@' seen in a token stream
+    if "@" in s:
+        # Sometimes extra junk sticks before/after; grab the tightest email-like span
+        m2 = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", s)
+        if m2:
+            return m2.group(0)
+
+    return None
 
 async def handle_twilio(ws):
     if ws.path not in ("/ws/twilio",):
@@ -483,7 +522,6 @@ async def handle_twilio(ws):
 
     def schedule_silence_nudge(delay_sec: float = 7.0):
         nonlocal silence_nudge_task, nudge_sent
-        # only schedule if we haven't nudged this quiet period
         if nudge_sent:
             return
         cancel_task(silence_nudge_task)
@@ -504,7 +542,6 @@ async def handle_twilio(ws):
         if not text or stopped_flag:
             return asyncio.create_task(asyncio.sleep(0))  # dummy
 
-        # stop any pending nudge whenever we speak
         cancel_task(silence_nudge_task)
 
         if speak_task and not speak_task.done():
@@ -513,10 +550,8 @@ async def handle_twilio(ws):
             except asyncio.CancelledError: pass
 
         current_tts_label = label
-        # If we're about to speak a real answer, add a short grace window to ignore barge-in
         if label.startswith("answer:"):
             barge_grace_until = time.time() + 0.9  # ~900ms grace
-        # Reset nudge-sent when we present a fresh soft prompt
         if label in ("menu", "fallback", "email_reprompt", "welcome_menu"):
             nudge_sent = False
 
@@ -535,7 +570,6 @@ async def handle_twilio(ws):
             finally:
                 if current_tts_label == label:
                     current_tts_label = ""
-                # Only schedule nudges after soft prompts (not after a nudge itself)
                 if label in ("menu", "fallback", "email_reprompt") and not awaiting_email:
                     schedule_silence_nudge(7.0)
 
@@ -588,7 +622,6 @@ async def handle_twilio(ws):
 
         # -------- email capture path --------
         if awaiting_email:
-            # accumulate
             if text:
                 email_buffer = (email_buffer + " " + text).strip()
                 if len(email_buffer) > 300:
@@ -604,6 +637,10 @@ async def handle_twilio(ws):
             if m_curr:
                 await confirm_and_menu(m_curr.group(0)); return
 
+            # allow normalizer to return first found email even inside clutter
+            if spoken_buf:
+                await confirm_and_menu(spoken_buf); return
+
             # LLM assist (fast, cached)
             llm_task = asyncio.create_task(call_openai_nlu(email_buffer)) if OPENAI_ENABLE else None
             if llm_task:
@@ -615,7 +652,6 @@ async def handle_twilio(ws):
                 except asyncio.TimeoutError:
                     pass
 
-            # allow exit
             if classify_intent_or_none(text) == "none":
                 done_flag = True
                 cancel_task(email_timeout_task)
@@ -634,7 +670,6 @@ async def handle_twilio(ws):
         heuristic_intent = classify_intent_or_none(text)
         intent = heuristic_intent
 
-        # Only use OpenAI if our heuristic couldn’t decide
         if OPENAI_ENABLE and heuristic_intent == "fallback":
             try:
                 r = await asyncio.wait_for(call_openai_nlu(text), timeout=OPENAI_TIMEOUT_S)
@@ -690,18 +725,15 @@ async def handle_twilio(ws):
             if isinstance(item, tuple) and len(item) == 2 and item[0] == "__EVENT__":
                 ev = item[1]
                 if ev == "SpeechStarted":
-                    # user engaged — cancel nudges, reset nudge gate
                     cancel_task(menu_task)
                     cancel_task(followup_task)
                     cancel_task(silence_nudge_task)
                     nudge_sent = False
 
-                    # Respect grace window for answers
                     now = time.time()
                     if current_tts_label.startswith("answer:") and now < barge_grace_until:
                         continue
 
-                    # Cancel only soft prompts
                     if current_tts_label in ("menu", "fallback", "email_reprompt", "nudge"):
                         if speak_task and not speak_task.done():
                             speak_task.cancel()
