@@ -327,6 +327,48 @@ async def deepgram_stream(pcm_iter):
 # --------- Twilio WS Server with email capture state ---------
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
+_NUMBER_WORDS = {
+    "zero":"0","oh":"0","one":"1","two":"2","three":"3","four":"4","for":"4","five":"5",
+    "six":"6","seven":"7","eight":"8","nine":"9","ten":"10","eleven":"11","twelve":"12",
+    "thirteen":"13","fourteen":"14","fifteen":"15","sixteen":"16","seventeen":"17",
+    "eighteen":"18","nineteen":"19","twenty":"20","thirty":"30","forty":"40","fifty":"50",
+    "sixty":"60","seventy":"70","eighty":"80","ninety":"90",
+}
+
+def _word_numbers_to_digits(tokens):
+    out = []
+    for w in tokens:
+        lw = w.lower()
+        if lw in _NUMBER_WORDS:
+            out.append(_NUMBER_WORDS[lw])
+        else:
+            out.append(w)
+    return out
+
+_SP_OK = {"at":"@", "dot":".", "period":".", "underscore":"_", "dash":"-", "hyphen":"-", "plus":"+"}
+
+
+def normalize_spoken_email(text: str) -> str | None:
+    t = re.sub(r"[^\w\s@.+-]", " ", text.lower())
+    toks = [w for w in t.split() if w]
+    toks = _word_numbers_to_digits(toks)
+    mapped = [ _SP_OK.get(w, w) for w in toks ]
+    s = " ".join(mapped)
+    s = re.sub(r"\s*@\s*", "@", s)
+    s = re.sub(r"\s*\.\s*", ".", s)
+    if "@" in s:
+        local, _, domain = s.partition("@")
+        local = re.sub(r"\s+", "", local)
+        domain = re.sub(r"\s+", "", domain)
+        s = f"{local}@{domain}"
+    # Common ASR fixes
+    s = re.sub(r"\.come\b", ".com", s)
+    s = re.sub(r"\.calm\b", ".com", s)
+    s = re.sub(r"\.orgg\b", ".org", s)
+    s = s.strip()
+    return s if EMAIL_RE.fullmatch(s or "") else None
+
+
 async def handle_twilio(ws):
     if ws.path not in ("/ws/twilio",):
         await ws.close(code=1008, reason="Unexpected path"); return
@@ -449,19 +491,26 @@ async def handle_twilio(ws):
 
         # If we're waiting for an email, try to capture it first.
         if awaiting_email:
+            spoken = normalize_spoken_email(text)
+            if spoken and EMAIL_RE.fullmatch(spoken):
+                await confirm_and_menu(spoken)
+                return
+
             m = EMAIL_RE.search(text)
             if m:
                 await confirm_and_menu(m.group(0))
                 return
-            # Also allow the user to bail out
+
             if classify_intent_or_none(text) == "none":
                 done_flag = True
                 cancel_task(email_timeout_task)
                 await speak(GOODBYE, label="goodbye")
                 return
-            # Otherwise ignore non-emails here (no menu); the timeout will reprompt.
+
             print("EMAIL ▶ not found in utterance")
             return
+
+
 
         intent = classify_intent_or_none(text)
         print("INTENT ▶", intent)
@@ -516,13 +565,17 @@ async def handle_twilio(ws):
                 if ev == "SpeechStarted":
                     cancel_task(menu_task)
                     cancel_task(followup_task)
-                    # don't interrupt the initial welcome+menu
                     if current_tts_label not in ("welcome_menu",):
                         if speak_task and not speak_task.done():
                             speak_task.cancel()
                             try: await speak_task
                             except asyncio.CancelledError: pass
+                    # ⬅️ If we're waiting for an email, reset the reprompt timer so we don't barge in
+                    if awaiting_email:
+                        cancel_task(email_timeout_task)
+                        start_email_timeout(12.0)
                 continue
+
 
             utter, is_final = item
             if not utter: continue
