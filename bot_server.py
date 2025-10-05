@@ -447,7 +447,10 @@ async def handle_twilio(ws):
     silence_nudge_task: asyncio.Task | None = None
 
     current_tts_label = ""  # "welcome_menu" | "answer:*" | "menu" | "goodbye" | "fallback" | "email_reprompt" | "nudge" | ""
-    barge_grace_until = 0.0  # <—— grace window wall-clock (seconds since epoch)
+    barge_grace_until = 0.0  # grace window wall-clock
+
+    # nudge behavior
+    nudge_sent = False  # one nudge per quiet period
 
     # simple state
     awaiting_email = False
@@ -479,22 +482,30 @@ async def handle_twilio(ws):
             t.cancel()
 
     def schedule_silence_nudge(delay_sec: float = 7.0):
-        nonlocal silence_nudge_task
+        nonlocal silence_nudge_task, nudge_sent
+        # only schedule if we haven't nudged this quiet period
+        if nudge_sent:
+            return
         cancel_task(silence_nudge_task)
         async def _nudge():
+            nonlocal nudge_sent
             try:
                 await asyncio.sleep(delay_sec)
-                if not (stopped_flag or done_flag) and current_tts_label == "" and not awaiting_email:
+                if not (stopped_flag or done_flag) and current_tts_label == "" and not awaiting_email and not nudge_sent:
+                    nudge_sent = True
                     await speak("You can say overview, pricing, pilot programs, hours, or how to get started.", label="nudge")
             except asyncio.CancelledError:
                 return
         silence_nudge_task = asyncio.create_task(_nudge())
 
     async def speak(text: str, label: str = "tts") -> asyncio.Task:
-        nonlocal speak_task, current_tts_label, awaiting_email, barge_grace_until
+        nonlocal speak_task, current_tts_label, awaiting_email, barge_grace_until, silence_nudge_task, nudge_sent
         text = (text or "").strip()
         if not text or stopped_flag:
             return asyncio.create_task(asyncio.sleep(0))  # dummy
+
+        # stop any pending nudge whenever we speak
+        cancel_task(silence_nudge_task)
 
         if speak_task and not speak_task.done():
             speak_task.cancel()
@@ -504,7 +515,11 @@ async def handle_twilio(ws):
         current_tts_label = label
         # If we're about to speak a real answer, add a short grace window to ignore barge-in
         if label.startswith("answer:"):
-            barge_grace_until = time.time() + 0.9  # 900ms grace
+            barge_grace_until = time.time() + 0.9  # ~900ms grace
+        # Reset nudge-sent when we present a fresh soft prompt
+        if label in ("menu", "fallback", "email_reprompt", "welcome_menu"):
+            nudge_sent = False
+
         print(f"SAY ▶ {label}")
 
         async def _run():
@@ -520,8 +535,8 @@ async def handle_twilio(ws):
             finally:
                 if current_tts_label == label:
                     current_tts_label = ""
-                # Only schedule nudges when not waiting for email
-                if label in ("menu", "fallback", "email_reprompt", "nudge") and not awaiting_email:
+                # Only schedule nudges after soft prompts (not after a nudge itself)
+                if label in ("menu", "fallback", "email_reprompt") and not awaiting_email:
                     schedule_silence_nudge(7.0)
 
         speak_task = asyncio.create_task(_run())
@@ -627,7 +642,6 @@ async def handle_twilio(ws):
                 if li in INTENT_ENUM and li != "fallback":
                     intent = li
             except asyncio.TimeoutError:
-                # quiet fail — no noisy logs on normal paths
                 pass
 
         print("INTENT ▶", intent)
@@ -659,6 +673,7 @@ async def handle_twilio(ws):
         await speak(RESPONSES["fallback"], label="fallback")
 
     async def brain():
+        nonlocal nudge_sent
         if not DEEPGRAM_KEY: return
         try:
             await asyncio.wait_for(first_media.wait(), timeout=20)
@@ -675,18 +690,19 @@ async def handle_twilio(ws):
             if isinstance(item, tuple) and len(item) == 2 and item[0] == "__EVENT__":
                 ev = item[1]
                 if ev == "SpeechStarted":
+                    # user engaged — cancel nudges, reset nudge gate
                     cancel_task(menu_task)
                     cancel_task(followup_task)
                     cancel_task(silence_nudge_task)
+                    nudge_sent = False
 
                     # Respect grace window for answers
                     now = time.time()
                     if current_tts_label.startswith("answer:") and now < barge_grace_until:
-                        # Ignore early barge-in (likely echo) — do nothing
                         continue
 
-                    # Only cancel *soft* prompts (never cancel real answers/welcome)
-                    if current_tts_label in ("menu", "fallback", "email_reprompt"):
+                    # Cancel only soft prompts
+                    if current_tts_label in ("menu", "fallback", "email_reprompt", "nudge"):
                         if speak_task and not speak_task.done():
                             speak_task.cancel()
                             try:
@@ -694,7 +710,6 @@ async def handle_twilio(ws):
                             except asyncio.CancelledError:
                                 pass
 
-                    # If we're waiting for an email, reset the reprompt timer so we don't barge in mid-speech.
                     if awaiting_email:
                         cancel_task(email_timeout_task)
                         start_email_timeout(12.0)
