@@ -376,6 +376,7 @@ async def handle_twilio(ws):
     done_flag = False
     stopped_flag = False
     menu_task: asyncio.Task | None = None  # scheduled "ask menu after quiet"
+    current_tts_label = ""  # "welcome" | "answer:*" | "menu" | "goodbye" | "fallback" | ""
 
     async def pcm_iter():
         while True:
@@ -397,31 +398,33 @@ async def handle_twilio(ws):
             conn_open = False; return False
 
     async def speak(text: str, label: str = "tts"):
-        nonlocal speak_task
+        nonlocal speak_task, current_tts_label
         text = (text or "").strip()
         if not text or stopped_flag: return
+
         # cancel current TTS (barge-in safe)
         if speak_task and not speak_task.done():
             speak_task.cancel()
             try: await speak_task
             except asyncio.CancelledError: pass
 
+        current_tts_label = label
         print(f"SAY ▶ {label}")
-        async def _run():
-            pre = 50 + int(random.uniform(-10, 15))
-            await send_silence(send_pcm, max(pre, 20))
-            async for pcm in eleven_tts_stream_cached(text):
-                ok = await send_pcm(pcm)
-                if not ok: return
-            post = 50 + int(random.uniform(-10, 15))
-            await send_silence(send_pcm, max(post, 20))
-        speak_task = asyncio.create_task(_run())
 
-    async def ask_menu(immediate: bool = False):
-        if immediate:
-            await speak(menu_text(), label="menu")
-        else:
-            schedule_menu_after_quiet(1400)
+        async def _run():
+            try:
+                pre = 50 + int(random.uniform(-10, 15))
+                await send_silence(send_pcm, max(pre, 20))
+                async for pcm in eleven_tts_stream_cached(text):
+                    ok = await send_pcm(pcm)
+                    if not ok: return
+                post = 50 + int(random.uniform(-10, 15))
+                await send_silence(send_pcm, max(post, 20))
+            finally:
+                if current_tts_label == label:
+                    current_tts_label = ""
+
+        speak_task = asyncio.create_task(_run())
 
     def cancel_menu_task():
         nonlocal menu_task
@@ -441,6 +444,12 @@ async def handle_twilio(ws):
                 return
         menu_task = asyncio.create_task(_later())
 
+    async def ask_menu(immediate: bool = False):
+        if immediate:
+            await speak(menu_text(), label="menu")
+        else:
+            schedule_menu_after_quiet(1400)
+
     async def handle_user(text: str):
         nonlocal done_flag
         if done_flag or stopped_flag: return
@@ -455,16 +464,15 @@ async def handle_twilio(ws):
             return
 
         if intent in RESPONSES and intent != "fallback":
-            cancel_menu_task()                # 1) stop any pending menu
-            await speak(RESPONSES[intent],    # 2) speak the answer
+            cancel_menu_task()                        # 1) stop any pending menu
+            await speak(RESPONSES[intent],            # 2) speak the answer
                         label=f"answer:{intent}")
-            schedule_menu_after_quiet(1400)   # 3) only then schedule the menu
+            schedule_menu_after_quiet(1400)           # 3) only then schedule the menu
             return
 
-        # fallback → offer menu (scheduled, not immediate)
+        # fallback → offer menu text (scheduled via speak(fallback) text already contains choices)
         cancel_menu_task()
         await speak(RESPONSES["fallback"], label="fallback")
-        # note: fallback text already *is* the menu text
 
     async def brain():
         if not DEEPGRAM_KEY: return
@@ -484,11 +492,13 @@ async def handle_twilio(ws):
             if isinstance(item, tuple) and len(item) == 2 and item[0] == "__EVENT__":
                 ev = item[1]
                 if ev == "SpeechStarted":
+                    # cancel any pending menu; don't interrupt welcome
                     cancel_menu_task()
-                    if speak_task and not speak_task.done():
-                        speak_task.cancel()
-                        try: await speak_task
-                        except asyncio.CancelledError: pass
+                    if current_tts_label != "welcome":
+                        if speak_task and not speak_task.done():
+                            speak_task.cancel()
+                            try: await speak_task
+                            except asyncio.CancelledError: pass
                 continue
 
             utter, is_final = item
@@ -503,6 +513,7 @@ async def handle_twilio(ws):
                     pending_final = utter.strip()
                     pending_ts = now
 
+                # respond on sentence end or short length
                 if re.search(r"[.!?…]\s*$", pending_final) or len(pending_final.split()) >= 2:
                     await handle_user(pending_final)
                     pending_final = None
@@ -521,14 +532,12 @@ async def handle_twilio(ws):
                 start_info = data.get("start", {}) or {}
                 stream_sid = start_info.get("streamSid")
                 print(f"WS ▶ start streamSid={stream_sid}")
-                # schedule welcome/menu after a brief quiet window (not immediate)
-                def _schedule_welcome():
-                    async def later():
-                        await asyncio.sleep(0.9)
-                        if not stopped_flag:
-                            await speak(WELCOME_MENU, label="welcome")
-                    return asyncio.create_task(later())
-                menu_task = _schedule_welcome()
+
+                # Speak the greeting immediately
+                asyncio.create_task(speak(WELCOME, label="welcome"))
+
+                # Offer the menu only after brief silence (will be canceled if user speaks)
+                schedule_menu_after_quiet(1400)
 
             elif ev == "media":
                 payload_b64 = data["media"]["payload"]
