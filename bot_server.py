@@ -376,7 +376,7 @@ async def handle_twilio(ws):
     done_flag = False
     stopped_flag = False
     menu_task: asyncio.Task | None = None  # scheduled "ask menu after quiet"
-    current_tts_label = ""  # "welcome" | "answer:*" | "menu" | "goodbye" | "fallback" | ""
+    current_tts_label = ""  # "welcome_menu" | "answer:*" | "menu" | "goodbye" | "fallback" | ""
 
     async def pcm_iter():
         while True:
@@ -412,6 +412,7 @@ async def handle_twilio(ws):
         print(f"SAY ▶ {label}")
 
         async def _run():
+            nonlocal current_tts_label   # <-- fix UnboundLocalError
             try:
                 pre = 50 + int(random.uniform(-10, 15))
                 await send_silence(send_pcm, max(pre, 20))
@@ -492,9 +493,9 @@ async def handle_twilio(ws):
             if isinstance(item, tuple) and len(item) == 2 and item[0] == "__EVENT__":
                 ev = item[1]
                 if ev == "SpeechStarted":
-                    # cancel any pending menu; don't interrupt welcome
+                    # cancel any pending menu; don't interrupt the initial welcome+menu
                     cancel_menu_task()
-                    if current_tts_label != "welcome":
+                    if current_tts_label not in ("welcome_menu",):
                         if speak_task and not speak_task.done():
                             speak_task.cancel()
                             try: await speak_task
@@ -533,11 +534,10 @@ async def handle_twilio(ws):
                 stream_sid = start_info.get("streamSid")
                 print(f"WS ▶ start streamSid={stream_sid}")
 
-                # Speak the greeting immediately
-                asyncio.create_task(speak(WELCOME, label="welcome"))
+                # Say full welcome + menu immediately so callers know the options
+                asyncio.create_task(speak(WELCOME_MENU, label="welcome_menu"))
 
-                # Offer the menu only after brief silence (will be canceled if user speaks)
-                schedule_menu_after_quiet(1400)
+                # (no scheduled menu here; the initial prompt already contains it)
 
             elif ev == "media":
                 payload_b64 = data["media"]["payload"]
