@@ -1,47 +1,96 @@
-{% extends "admin/base.html" %}
 {% load static %}
-
-{% block title %}NeuroMed Admin{% endblock %}
-
-{# Add Tailwind (CDN is fine for admin) #}
-{% block extrastyle %}
-  {{ block.super }}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>NeuroMed Admin</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Tailwind CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
-    /* keep admin header tidy */
     .neuromed-brand a { text-decoration: none !important; }
+    code { background: #fff; border: 1px solid #e5e7eb; border-radius: 0.5rem; padding: 0.1rem 0.35rem; }
   </style>
-{% endblock %}
+</head>
+<body class="bg-slate-50 text-slate-900">
+  <!-- Header -->
+  <header class="bg-white border-b">
+    <div class="neuromed-brand max-w-5xl mx-auto w-full flex items-center justify-between gap-4 px-4 py-3">
+      <a href="/admin/" class="flex items-center gap-3">
+        <span class="inline-flex h-9 w-9 items-center justify-center rounded-xl bg-teal-600 text-white font-semibold">N</span>
+        <span class="text-xl font-semibold">NeuroMed Admin</span>
+      </a>
 
-{# Top-left logo/title + top-right action button #}
-{% block branding %}
-  <div class="neuromed-brand w-full flex items-center justify-between gap-4 px-2">
-    <a href="{% url 'admin:index' %}" class="flex items-center gap-3">
-      <span class="inline-flex h-8 w-8 items-center justify-center rounded-xl bg-teal-600 text-white font-semibold">N</span>
-      <span class="text-xl font-semibold">NeuroMed Admin</span>
-    </a>
+      <form method="post" action="{% url 'admin:neuromed_tools_call_me' %}" class="m-0">
+        {% csrf_token %}
+        <button
+          type="submit"
+          class="inline-flex items-center gap-2 rounded-xl bg-teal-600 hover:bg-teal-700 text-white px-4 py-2 shadow-sm
+                 ring-1 ring-teal-500/30 transition focus:outline-none focus:ring-2 focus:ring-teal-400"
+          title="Trigger a Twilio call to your phone">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M6.62 10.79a15.05 15.05 0 006.59 6.59l2.2-2.2a1 1 0 011.02-.24 11.36 11.36 0 003.56.57 1 1 0 011 1V20a1 1 0 01-1 1A17 17 0 013 4a1 1 0 011-1h2.49a1 1 0 011 1 11.36 11.36 0 00.57 3.56 1 1 0 01-.24 1.02l-2.2 2.2z"/>
+          </svg>
+          <span>Call my phone (Twilio)</span>
+        </button>
+      </form>
+    </div>
+  </header>
 
-    <form method="post" action="{% url 'admin:neuromed_tools_call_me' %}" class="m-0">
-      {% csrf_token %}
-      <button
-        type="submit"
-        class="inline-flex items-center gap-2 rounded-xl bg-teal-600 hover:bg-teal-700 text-white px-4 py-2 shadow-sm
-               ring-1 ring-teal-500/30 transition focus:outline-none focus:ring-2 focus:ring-teal-400">
-        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor">
-          <path d="M6.62 10.79a15.05 15.05 0 006.59 6.59l2.2-2.2a1 1 0 011.02-.24 11.36 11.36 0 003.56.57 1 1 0 011 1V20a1 1 0 01-1 1A17 17 0 013 4a1 1 0 011-1h2.49a1 1 0 011 1 11.36 11.36 0 00.57 3.56 1 1 0 01-.24 1.02l-2.2 2.2z"/>
-        </svg>
-        <span>Call my phone (Twilio)</span>
-      </button>
-    </form>
+  <!-- Helper bar -->
+  <div class="bg-slate-100 border-b">
+    <div class="max-w-5xl mx-auto px-4 py-2 text-sm text-slate-700">
+      Make sure servers are running:
+      <code>python manage.py runserver</code>
+      ·
+      <code>python bot_server.py</code>
+      ·
+      <span class="text-slate-500">WS:</span>
+      <code>{{ request.META.HTTP_HOST }}</code>
+    </div>
   </div>
-{% endblock %}
 
-{# Optional: small helper bar under the header #}
-{% block nav-global %}
-  <div class="px-2 py-2 text-sm text-slate-600">
-    Make sure servers are running:
-    <code>python manage.py runserver</code> ·
-    <code>python bot_server.py</code> ·
-    <span class="text-slate-400">WS:</span> <code>{{ request.META.HTTP_HOST }}</code>
+  <!-- Flash messages -->
+  <div class="max-w-5xl mx-auto px-4 mt-4 space-y-2">
+    {% if messages %}
+      {% for message in messages %}
+        <div class="rounded-xl border px-4 py-3 {% if message.tags == 'success' %}bg-emerald-50 border-emerald-200 text-emerald-800{% elif message.tags == 'error' %}bg-rose-50 border-rose-200 text-rose-800{% else %}bg-slate-50 border-slate-200 text-slate-800{% endif %}">
+          {{ message|safe }}
+        </div>
+      {% endfor %}
+    {% endif %}
   </div>
-{% endblock %}
+
+  <!-- Main content -->
+  <main class="max-w-5xl mx-auto px-4 py-6">
+    <div class="bg-white border rounded-2xl p-5">
+      <h2 class="text-lg font-semibold mb-2">Tools</h2>
+      <p class="text-slate-600">Quick internal actions for your NeuroMed stack.</p>
+
+      <div class="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div class="rounded-xl border p-4">
+          <div class="font-medium mb-1">Place test call</div>
+          <p class="text-sm text-slate-600 mb-3">Trigger an outbound Twilio call to the configured phone.</p>
+          <form method="post" action="{% url 'admin:neuromed_tools_call_me' %}">
+            {% csrf_token %}
+            <button
+              type="submit"
+              class="inline-flex items-center gap-2 rounded-xl bg-teal-600 hover:bg-teal-700 text-white px-4 py-2 shadow-sm
+                     ring-1 ring-teal-500/30 transition focus:outline-none focus:ring-2 focus:ring-teal-400">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M6.62 10.79a15.05 15.05 0 006.59 6.59l2.2-2.2a1 1 0 011.02-.24 11.36 11.36 0 003.56.57 1 1 0 011 1V20a1 1 0 01-1 1A17 17 0 013 4a1 1 0 011-1h2.49a1 1 0 011 1 11.36 11.36 0 00.57 3.56 1 1 0 01-.24 1.02l-2.2 2.2z"/>
+              </svg>
+              <span>Call my phone</span>
+            </button>
+          </form>
+        </div>
+
+        <div class="rounded-xl border p-4">
+          <div class="font-medium mb-1">Status</div>
+          <p class="text-sm text-slate-600">Add quick checks or links here later (logs, health, etc.).</p>
+        </div>
+      </div>
+    </div>
+  </main>
+</body>
+</html>
