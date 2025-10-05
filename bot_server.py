@@ -22,9 +22,12 @@ def menu_text():
         "Which one would you like? You can also say 'none' to finish."
     )
 
+DOMAIN_PLAIN  = "neuromedai.org"
+DOMAIN_SPOKEN = "Neuro Med A I dot org"
+
 WELCOME = "Hey there! Welcome to NeuroMed AI — your kind and clever health assistant. "
 WELCOME_MENU = WELCOME + menu_text()
-GOODBYE = "Thank you! Don’t forget to visit neuromedai.org."
+GOODBYE = f"Thank you! Don’t forget to visit {DOMAIN_SPOKEN}."
 
 RESPONSES = {
     "overview": (
@@ -49,7 +52,7 @@ RESPONSES = {
         "If you share your time zone, I’ll find a time that works best for you."
     ),
     "start": (
-        "Awesome! Just head over to neuromedai.org and sign up as one of our beta testers — see you there!"
+         f"Awesome! Just head over to {DOMAIN_SPOKEN} and sign up as one of our beta testers — see you there!"
     ),
     "fallback": menu_text(),
 }
@@ -61,6 +64,8 @@ THANKS_RE  = RX(r"\b(thanks?|thank\s*you|that'?s\s*all|nothing\s*else|i'?m\s*goo
 INTENT_NONE = RX(r"\b(none|finish|end|no(?:\s+thanks|\s+thank\s*you)?)\b")
 
 # Primary patterns
+
+
 INTENTS = [
     ("overview", RX(
         r"\b(over\s*view|overview|what\s+is|tell\s+me\s+more|how\s+does\s+it\s+work|"
