@@ -62,6 +62,8 @@ RX = lambda p: re.compile(p, re.I)
 HELLO_RE   = RX(r"\b(hello|hi|hey|good\s*(morning|afternoon|evening)|yo)\b")
 THANKS_RE  = RX(r"\b(thanks?|thank\s*you|that'?s\s*all|nothing\s*else|i'?m\s*good|we'?re\s*good)\b")
 INTENT_NONE = RX(r"\b(none|finish|end|no(?:\s+thanks|\s+thank\s*you)?)\b")
+# put near your other regex helpers
+PILOT_PHONETIC = RX(r"\bp(?:y|i|ai|ee)?l(?:o|a)?t(?:\s+pro(?:g|gr|gram)?)?\b")
 
 # Primary patterns
 
@@ -162,7 +164,7 @@ def _soft_match_intent(text: str) -> str | None:
             score = max(_similar(joined, syn), max((_similar(tok, syn) for tok in tokens), default=0.0))
             if score > best_score:
                 best_intent, best_score = intent, score
-    if best_score >= 0.75:
+    if best_score >= 0.68:
         return best_intent
 
     for intent, syns in CHOICE_SYNONYMS.items():
@@ -176,6 +178,11 @@ def classify_intent_or_none(text: str) -> str:
     t = _strip_fillers(text or "")
     if not t:
         return "fallback"
+
+    # NEW: strong early hook for "pilot" even with mishears
+    if PILOT_PHONETIC.search(t.lower()):
+        return "pilot"
+
     soft = _soft_match_intent(t)
     if soft:
         return soft
@@ -186,6 +193,7 @@ def classify_intent_or_none(text: str) -> str:
     if bare in {"overview","privacy","pricing","pilot","hours","start"}:
         return bare
     return "fallback"
+
 
 # --------- helpers ---------
 def b64_to_bytes(s: str) -> bytes:
@@ -262,14 +270,26 @@ async def deepgram_stream(pcm_iter):
     async with websockets.connect(url, extra_headers=headers, max_size=2**20) as dg:
         try:
             await dg.send(json.dumps({
-                "type": "Configure",
-                "keywords": [
-                    "NeuroMed","overview","privacy","pricing","pilot","pilot program","hours","start",
-                    "trial","demo","evaluation","schedule","appointment",
-                    "violet","violent","silo","pilate","pylot","kyla","kylas","kaila","kyle",
-                    "program","highlights","features","email","address"
-                ]
-            }))
+            "type": "Configure",
+            "keywords": [
+                "NeuroMed","overview","privacy","pricing","pilot","pilot program","hours","start",
+                "trial","demo","evaluation","schedule","appointment",
+                "violet","violent","silo","pilate","pylot","kyla","kylas","kaila","kyle",
+                "program","highlights","features","email","address",
+                "neuromed","neuro med","neuro meda","neuromate","neuro net","narrow med","new roomed",
+                "pylet","pile it","pylot program","pilots","pilot test","pilot run","pilot project",
+                "pillow","bilot","biolet","vilo","file it","pilotage","pilotage program",
+                "trial run","try out","free trial","evaluation program","assessment","orientation",
+                "schedule","scheduled","appointment","booking","book","demo day","demo session",
+                "overview video","introduction","about","info","information","details","summary",
+                "features","functions","capabilities","benefits","highlights","what it does",
+                "how it works","how to start","get started","begin","beginner","start now",
+                "pricing plan","plans","subscription","membership","cost","fee","payment",
+                "hours","working hours","time","open","availability","support hours",
+                "email address","email us","send email","contact","message","reach out"
+            ]
+        }))
+
         except Exception as e:
             print("DG CONFIG WARN ▶", repr(e))
 
