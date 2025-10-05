@@ -447,6 +447,7 @@ async def handle_twilio(ws):
     silence_nudge_task: asyncio.Task | None = None
 
     current_tts_label = ""  # "welcome_menu" | "answer:*" | "menu" | "goodbye" | "fallback" | "email_reprompt" | "nudge" | ""
+    barge_grace_until = 0.0  # <—— grace window wall-clock (seconds since epoch)
 
     # simple state
     awaiting_email = False
@@ -490,7 +491,7 @@ async def handle_twilio(ws):
         silence_nudge_task = asyncio.create_task(_nudge())
 
     async def speak(text: str, label: str = "tts") -> asyncio.Task:
-        nonlocal speak_task, current_tts_label, awaiting_email
+        nonlocal speak_task, current_tts_label, awaiting_email, barge_grace_until
         text = (text or "").strip()
         if not text or stopped_flag:
             return asyncio.create_task(asyncio.sleep(0))  # dummy
@@ -501,6 +502,9 @@ async def handle_twilio(ws):
             except asyncio.CancelledError: pass
 
         current_tts_label = label
+        # If we're about to speak a real answer, add a short grace window to ignore barge-in
+        if label.startswith("answer:"):
+            barge_grace_until = time.time() + 0.9  # 900ms grace
         print(f"SAY ▶ {label}")
 
         async def _run():
@@ -613,16 +617,17 @@ async def handle_twilio(ws):
 
         # -------- intent classification path --------
         heuristic_intent = classify_intent_or_none(text)
-        llm_task = asyncio.create_task(call_openai_nlu(text)) if OPENAI_ENABLE else None
-
         intent = heuristic_intent
-        if heuristic_intent == "fallback" and llm_task:
+
+        # Only use OpenAI if our heuristic couldn’t decide
+        if OPENAI_ENABLE and heuristic_intent == "fallback":
             try:
-                r = await asyncio.wait_for(llm_task, timeout=OPENAI_TIMEOUT_S)
+                r = await asyncio.wait_for(call_openai_nlu(text), timeout=OPENAI_TIMEOUT_S)
                 li = (r or {}).get("intent")
                 if li in INTENT_ENUM and li != "fallback":
                     intent = li
             except asyncio.TimeoutError:
+                # quiet fail — no noisy logs on normal paths
                 pass
 
         print("INTENT ▶", intent)
@@ -673,16 +678,27 @@ async def handle_twilio(ws):
                     cancel_task(menu_task)
                     cancel_task(followup_task)
                     cancel_task(silence_nudge_task)
-                    # Only cancel soft prompts
-                    if current_tts_label in ("menu", "fallback", "email_reprompt", "nudge"):
+
+                    # Respect grace window for answers
+                    now = time.time()
+                    if current_tts_label.startswith("answer:") and now < barge_grace_until:
+                        # Ignore early barge-in (likely echo) — do nothing
+                        continue
+
+                    # Only cancel *soft* prompts (never cancel real answers/welcome)
+                    if current_tts_label in ("menu", "fallback", "email_reprompt"):
                         if speak_task and not speak_task.done():
                             speak_task.cancel()
-                            try: await speak_task
-                            except asyncio.CancelledError: pass
+                            try:
+                                await speak_task
+                            except asyncio.CancelledError:
+                                pass
+
+                    # If we're waiting for an email, reset the reprompt timer so we don't barge in mid-speech.
                     if awaiting_email:
                         cancel_task(email_timeout_task)
                         start_email_timeout(12.0)
-                continue  # do not parse events as transcripts
+                    continue  # important
 
             utter, is_final = item
             if not utter: continue
