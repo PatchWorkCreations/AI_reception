@@ -6,7 +6,7 @@ from difflib import SequenceMatcher
 load_dotenv()
 
 # --------- ENV ---------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # not used in simple mode
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # used for micro NLU
 DEEPGRAM_KEY   = os.getenv("DEEPGRAM_API_KEY")
 ELEVEN_KEY     = os.getenv("ELEVENLABS_API_KEY")
 HTTP_ORIGIN    = os.getenv("PUBLIC_HTTP_ORIGIN", "http://localhost:8000")
@@ -14,6 +14,11 @@ PORT           = int(os.getenv("PORT", "8080"))
 
 ECHO_BACK      = os.getenv("ECHO_BACK", "0") == "1"
 ELEVEN_VOICE   = os.getenv("ELEVENLABS_VOICE_ID", "Bella")
+
+# OpenAI model + timeouts (fast + cheap)
+OPENAI_MODEL         = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_TIMEOUT_S     = float(os.getenv("OPENAI_TIMEOUT_S", "0.35"))
+OPENAI_ENABLE        = bool(OPENAI_API_KEY)
 
 # --------- Menu content ---------
 def menu_text():
@@ -52,7 +57,7 @@ RESPONSES = {
         "If you share your time zone, I’ll find a time that works best for you."
     ),
     "start": (
-         f"Awesome! Just head over to {DOMAIN_SPOKEN} and sign up as one of our beta testers — see you there!"
+        f"Awesome! Just head over to {DOMAIN_SPOKEN} and sign up as one of our beta testers — see you there!"
     ),
     "fallback": menu_text(),
 }
@@ -62,7 +67,6 @@ RX = lambda p: re.compile(p, re.I)
 HELLO_RE   = RX(r"\b(hello|hi|hey|good\s*(morning|afternoon|evening)|yo)\b")
 THANKS_RE  = RX(r"\b(thanks?|thank\s*you|that'?s\s*all|nothing\s*else|i'?m\s*good|we'?re\s*good)\b")
 INTENT_NONE = RX(r"\b(none|finish|end|no(?:\s+thanks|\s+thank\s*you)?)\b")
-# phonetic "pilot"
 PILOT_PHONETIC = RX(r"\bp(?:y|i|ai|ee)?l(?:o|a)?t(?:\s+pro(?:g|gr|gram)?)?\b")
 
 # Primary patterns
@@ -94,35 +98,12 @@ CHOICE_SYNONYMS = {
 }
 
 SOUNDA_LIKE = {
-    # pilot-ish
-    "violet": "pilot",
-    "violent": "pilot",
-    "silo": "pilot",
-    "pylet": "pilot",
-    "pilate": "pilot",
-    "pilot": "pilot",
-    "kylas": "pilot",
-    "kyla": "pilot",
-    "kaila": "pilot",
-    "kyle": "pilot",
-    "pylot": "pilot",
-    "bogdan": "pilot",
-    # program
-    "program": "program",
-    "doggroom": "program",
-    "doggroomer": "program",
-    "dawgroom": "program",
-    # pricing
-    "prizing": "pricing",
-    "prise": "price",
-    "prices": "pricing",
-    # hours
-    "ours": "hours",
-    "hour": "hours",
-    # privacy
-    "privacy": "privacy",
-    "private": "privacy",
-    "secure": "privacy",
+    "violet": "pilot","violent": "pilot","silo": "pilot","pylet": "pilot","pilate": "pilot","pilot": "pilot",
+    "kylas":"pilot","kyla":"pilot","kaila":"pilot","kyle":"pilot","pylot":"pilot","bogdan":"pilot",
+    "program":"program","doggroom":"program","doggroomer":"program","dawgroom":"program",
+    "prizing":"pricing","prise":"price","prices":"pricing",
+    "ours":"hours","hour":"hours",
+    "privacy":"privacy","private":"privacy","secure":"privacy",
 }
 
 def _norm(s: str) -> str:
@@ -137,20 +118,14 @@ def _soft_map_token(tok: str) -> str:
 
 def _soft_match_intent(text: str) -> str | None:
     t = _norm(text)
-    if not t:
-        return None
-    if INTENT_NONE.search(t) or THANKS_RE.search(t):
-        return "none"
-    if HELLO_RE.search(t):
-        return "fallback"
+    if not t: return None
+    if INTENT_NONE.search(t) or THANKS_RE.search(t): return "none"
+    if HELLO_RE.search(t): return "fallback"
 
     tokens = [_soft_map_token(w) for w in t.split()]
     joined = " ".join(tokens)
 
-    # short/lone "program" → pilot
-    if "program" in tokens and len(tokens) <= 3:
-        return "pilot"
-    # "program" near pilot-ish
+    if "program" in tokens and len(tokens) <= 3: return "pilot"
     if "program" in tokens:
         for w in tokens:
             if _similar(w, "pilot") >= 0.60:
@@ -162,35 +137,107 @@ def _soft_match_intent(text: str) -> str | None:
             score = max(_similar(joined, syn), max((_similar(tok, syn) for tok in tokens), default=0.0))
             if score > best_score:
                 best_intent, best_score = intent, score
-    if best_score >= 0.68:
-        return best_intent
+    if best_score >= 0.68: return best_intent
 
     for intent, syns in CHOICE_SYNONYMS.items():
         if any(tok in syns for tok in tokens):
             return intent
-    if "program" in tokens:
-        return "pilot"
+    if "program" in tokens: return "pilot"
     return None
 
 def classify_intent_or_none(text: str) -> str:
     t = _strip_fillers(text or "")
-    if not t:
-        return "fallback"
-
-    # strong early hook for "pilot" even with mishears
-    if PILOT_PHONETIC.search(t.lower()):
-        return "pilot"
-
+    if not t: return "fallback"
+    if PILOT_PHONETIC.search(t.lower()): return "pilot"
     soft = _soft_match_intent(t)
-    if soft:
-        return soft
+    if soft: return soft
     for name, rx in INTENTS:
-        if rx.search(t):
-            return name
+        if rx.search(t): return name
     bare = _norm(t)
-    if bare in {"overview","privacy","pricing","pilot","hours","start"}:
-        return bare
+    if bare in {"overview","privacy","pricing","pilot","hours","start"}: return bare
     return "fallback"
+
+
+# ===== OpenAI micro NLU (parallel, tiny, cached) =====
+# We call this ONLY on final transcripts – small prompt, low temp, strict JSON.
+
+_openai_cache: dict[str, dict] = {}
+OPENAI_CACHE_MAX = 200
+
+def _cache_get(k: str):
+    return _openai_cache.get(k)
+
+def _cache_set(k: str, v: dict):
+    if len(_openai_cache) > OPENAI_CACHE_MAX:
+        _openai_cache.clear()
+    _openai_cache[k] = v
+
+INTENT_ENUM = ["overview","privacy","pricing","pilot","hours","start","none","fallback"]
+
+def _intent_system_prompt():
+    return (
+        "Return strict JSON with keys intent and email.\n"
+        "intent must be one of: overview, privacy, pricing, pilot, hours, start, none, fallback.\n"
+        "email is a string if a valid email is mentioned/spoken (e.g., 'julia sixteen at gmail dot com' "
+        "→ julia16@gmail.com), else null. Do not include extra keys.\n"
+        "Consider homophones and ASR noise. Keep it fast. No prose."
+    )
+
+async def call_openai_nlu(text: str) -> dict:
+    """
+    Returns {"intent": <enum>, "email": <str|None>, "confidence": float}
+    If OPENAI is disabled or any error/timeout happens, returns {}.
+    """
+    if not OPENAI_ENABLE or not text.strip():
+        return {}
+
+    key = f"nlu::{text.strip().lower()}"
+    cached = _cache_get(key)
+    if cached:
+        return cached
+
+    # super small chat completion with JSON response
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    user_msg = text.strip()
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": 0.1,
+        "max_tokens": 60,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": _intent_system_prompt()},
+            {"role": "user", "content": user_msg},
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(OPENAI_TIMEOUT_S)) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code != 200:
+                # print once to logs for visibility; degrade gracefully
+                print("OPENAI ERR ▶", resp.status_code, resp.text[:200])
+                return {}
+            data = resp.json()
+            content = (data.get("choices", [{}])[0]
+                           .get("message", {})
+                           .get("content", "")).strip()
+            obj = json.loads(content or "{}")
+            intent = obj.get("intent")
+            email  = obj.get("email")
+            if intent not in INTENT_ENUM:
+                intent = "fallback"
+            out = {"intent": intent, "email": email if isinstance(email, str) and email else None, "confidence": 0.75}
+            _cache_set(key, out)
+            return out
+    except Exception as e:
+        # Timeout / network / parse issues → soft fail
+        print("OPENAI EXC ▶", repr(e))
+        return {}
 
 
 # --------- helpers ---------
@@ -274,17 +321,8 @@ async def deepgram_stream(pcm_iter):
                     "trial","demo","evaluation","schedule","appointment",
                     "violet","violent","silo","pilate","pylot","kyla","kylas","kaila","kyle",
                     "program","highlights","features","email","address",
-                    "neuromed","neuro med","neuro meda","neuromate","neuro net","narrow med","new roomed",
-                    "pylet","pile it","pylot program","pilots","pilot test","pilot run","pilot project",
-                    "pillow","bilot","biolet","vilo","file it","pilotage","pilotage program",
-                    "trial run","try out","free trial","evaluation program","assessment","orientation",
-                    "schedule","scheduled","appointment","booking","book","demo day","demo session",
-                    "overview video","introduction","about","info","information","details","summary",
-                    "features","functions","capabilities","benefits","highlights","what it does",
-                    "how it works","how to start","get started","begin","beginner","start now",
-                    "pricing plan","plans","subscription","membership","cost","fee","payment",
-                    "hours","working hours","time","open","availability","support hours",
-                    "email address","email us","send email","contact","message","reach out"
+                    "neuromed","neuro med","neuro med a i","neuro med ai",
+                    "pilot test","pilot run","pilot project","trial run","try out","evaluation program"
                 ]
             }))
         except Exception as e:
@@ -341,7 +379,7 @@ async def deepgram_stream(pcm_iter):
         finally:
             await feed_task
 
-# --------- Twilio WS Server with email capture + UX guards ---------
+# --------- Twilio WS Server with email capture + UX guards + OpenAI assist ---------
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 _NUMBER_WORDS = {
@@ -356,10 +394,8 @@ def _word_numbers_to_digits(tokens):
     out = []
     for w in tokens:
         lw = w.lower()
-        if lw in _NUMBER_WORDS:
-            out.append(_NUMBER_WORDS[lw])
-        else:
-            out.append(w)
+        if lw in _NUMBER_WORDS: out.append(_NUMBER_WORDS[lw])
+        else: out.append(w)
     return out
 
 _SP_OK = {"at":"@", "dot":".", "period":".", "underscore":"_", "dash":"-", "hyphen":"-", "plus":"+"}
@@ -377,7 +413,6 @@ def normalize_spoken_email(text: str) -> str | None:
         local = re.sub(r"\s+", "", local)
         domain = re.sub(r"\s+", "", domain)
         s = f"{local}@{domain}"
-    # Common ASR fixes
     s = re.sub(r"\.come\b", ".com", s)
     s = re.sub(r"\.calm\b", ".com", s)
     s = re.sub(r"\.orgg\b", ".org", s)
@@ -448,7 +483,7 @@ async def handle_twilio(ws):
         nonlocal speak_task, current_tts_label
         text = (text or "").strip()
         if not text or stopped_flag:
-            return asyncio.create_task(asyncio.sleep(0))  # dummy task
+            return asyncio.create_task(asyncio.sleep(0))  # dummy
 
         if speak_task and not speak_task.done():
             speak_task.cancel()
@@ -471,7 +506,6 @@ async def handle_twilio(ws):
             finally:
                 if current_tts_label == label:
                     current_tts_label = ""
-                # after soft prompts, schedule a gentle nudge
                 if label in ("menu", "fallback", "email_reprompt"):
                     schedule_silence_nudge(7.0)
 
@@ -513,7 +547,6 @@ async def handle_twilio(ws):
         email_nudged = False
         cancel_task(email_timeout_task)
         await speak(f"Got it. We’ll email you at {captured_email}.", label="email_confirm")
-        # after confirm, follow normal menu loop
         await asyncio.sleep(1.0)
         if not (stopped_flag or done_flag):
             await speak(menu_text(), label="menu")
@@ -522,17 +555,28 @@ async def handle_twilio(ws):
         nonlocal done_flag, awaiting_email, email_context, email_nudged
         if done_flag or stopped_flag: return
 
-        # If we're waiting for an email, try to capture it first.
+        # -------- email capture path --------
         if awaiting_email:
+            # run OpenAI extractor in parallel, but don't wait if our regex hits
+            llm_task = asyncio.create_task(call_openai_nlu(text)) if OPENAI_ENABLE else None
+
             spoken = normalize_spoken_email(text)
             if spoken and EMAIL_RE.fullmatch(spoken):
-                await confirm_and_menu(spoken)
-                return
+                await confirm_and_menu(spoken); return
 
             m = EMAIL_RE.search(text)
             if m:
-                await confirm_and_menu(m.group(0))
-                return
+                await confirm_and_menu(m.group(0)); return
+
+            # fall back to LLM if quick enough
+            if llm_task:
+                try:
+                    r = await asyncio.wait_for(llm_task, timeout=OPENAI_TIMEOUT_S)
+                    em = r.get("email") if isinstance(r, dict) else None
+                    if em and EMAIL_RE.fullmatch(em):
+                        await confirm_and_menu(em); return
+                except asyncio.TimeoutError:
+                    pass
 
             if classify_intent_or_none(text) == "none":
                 done_flag = True
@@ -541,15 +585,26 @@ async def handle_twilio(ws):
                 return
 
             print("EMAIL ▶ not found in utterance")
-
-            # One gentle hint if they spoke something that's not an email
             if not email_nudged and current_tts_label == "":
                 email_nudged = True
                 await speak("No rush — just your email address is perfect.", label="email_reprompt")
                 start_email_timeout(12.0)
             return
 
-        intent = classify_intent_or_none(text)
+        # -------- intent classification path --------
+        heuristic_intent = classify_intent_or_none(text)
+        llm_task = asyncio.create_task(call_openai_nlu(text)) if OPENAI_ENABLE else None
+
+        intent = heuristic_intent
+        if heuristic_intent == "fallback" and llm_task:
+            try:
+                r = await asyncio.wait_for(llm_task, timeout=OPENAI_TIMEOUT_S)
+                li = r.get("intent")
+                if li in INTENT_ENUM and li != "fallback":
+                    intent = li
+            except asyncio.TimeoutError:
+                pass
+
         print("INTENT ▶", intent)
 
         if intent == "none":
@@ -560,15 +615,11 @@ async def handle_twilio(ws):
 
         if intent in RESPONSES and intent != "fallback":
             cancel_task(followup_task)
-            # Speak the answer
             ans_task = await speak(RESPONSES[intent], label=f"answer:{intent}")
-
-            # If this path requests an email, go into capture mode; do NOT schedule menu yet
             if intent in ("pricing", "pilot"):
                 awaiting_email = True
                 email_context = intent
                 email_nudged = False
-                # when the answer finishes, start the email timeout
                 async def _after_answer():
                     try:
                         await ans_task
@@ -577,11 +628,9 @@ async def handle_twilio(ws):
                         pass
                 asyncio.create_task(_after_answer())
             else:
-                # normal intents → menu after the answer
                 schedule_menu_after_answer(ans_task, 1200)
             return
 
-        # fallback: offer choices (acts like menu)
         await speak(RESPONSES["fallback"], label="fallback")
 
     async def brain():
@@ -604,19 +653,16 @@ async def handle_twilio(ws):
                     cancel_task(menu_task)
                     cancel_task(followup_task)
                     cancel_task(silence_nudge_task)
-
-                    # Only cancel "soft" prompts; do NOT cancel main answers.
+                    # Only cancel soft prompts
                     if current_tts_label in ("menu", "fallback", "email_reprompt"):
                         if speak_task and not speak_task.done():
                             speak_task.cancel()
                             try: await speak_task
                             except asyncio.CancelledError: pass
-
-                    # If we're waiting for an email, reset the reprompt timer so we don't barge in mid-speech.
                     if awaiting_email:
                         cancel_task(email_timeout_task)
                         start_email_timeout(12.0)
-                continue  # <—— important so we don't parse events as transcripts
+                continue
 
             utter, is_final = item
             if not utter: continue
@@ -649,18 +695,9 @@ async def handle_twilio(ws):
                 stream_sid = start_info.get("streamSid")
                 print(f"WS ▶ start streamSid={stream_sid}")
 
-                # Say full welcome + menu immediately so callers know the options
                 await speak(WELCOME_MENU, label="welcome_menu")
-                # Schedule a gentle nudge if they don't speak
-                # (will be canceled the moment SpeechStarted fires, or after any soft prompt)
-                # Start it now so silence doesn't feel like the bot died.
-                # Note: welcome_menu is a "hard" prompt, so we don't barge-in cancel it.
-                # We schedule the nudge after it finishes automatically via speak() for soft prompts,
-                # but for welcome we trigger it explicitly:
-                # (Delay starts now; if they speak, SpeechStarted cancels it.)
-                # Slightly longer delay since they've just heard the options.
+
                 async def _after_welcome():
-                    # give welcome a breath to finish
                     await asyncio.sleep(0.8)
                     schedule_silence_nudge(7.0)
                 asyncio.create_task(_after_welcome())
@@ -702,6 +739,7 @@ async def main():
     print("ENV ▶ DEEPGRAM?   ", "yes" if DEEPGRAM_KEY else "missing")
     print("ENV ▶ ECHO_BACK   =", ECHO_BACK)
     print("ENV ▶ ELEVEN_VOICE=", ELEVEN_VOICE)
+    print("ENV ▶ OPENAI      =", "yes" if OPENAI_ENABLE else "disabled")
     print("ENV ▶ PORT        =", PORT)
 
     async with websockets.serve(
