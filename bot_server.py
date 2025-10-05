@@ -102,7 +102,6 @@ SOUNDA_LIKE = {
     "kaila": "pilot",
     "kyle": "pilot",
     "pylot": "pilot",
-    "bogdan": "pilot",   # surgical mapping based on your logs
     # program
     "program": "program",
     "doggroom": "program",
@@ -143,10 +142,8 @@ def _soft_match_intent(text: str) -> str | None:
     tokens = [_soft_map_token(w) for w in t.split()]
     joined = " ".join(tokens)
 
-    # short/lone "program" → pilot
     if "program" in tokens and len(tokens) <= 3:
         return "pilot"
-    # "program" near pilot-ish
     if "program" in tokens:
         for w in tokens:
             if _similar(w, "pilot") >= 0.60:
@@ -263,7 +260,7 @@ async def deepgram_stream(pcm_iter):
                     "NeuroMed","overview","privacy","pricing","pilot","pilot program","hours","start",
                     "trial","demo","evaluation","schedule","appointment",
                     "violet","violent","silo","pilate","pylot","kyla","kylas","kaila","kyle",
-                    "program","highlights","features","email","address"
+                    "program","highlights","features"
                 ]
             }))
         except Exception as e:
@@ -320,9 +317,7 @@ async def deepgram_stream(pcm_iter):
         finally:
             await feed_task
 
-# --------- Twilio WS Server with email capture state ---------
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-
+# --------- Twilio WS Server with answer-finish → quiet → menu ---------
 async def handle_twilio(ws):
     if ws.path not in ("/ws/twilio",):
         await ws.close(code=1008, reason="Unexpected path"); return
@@ -336,15 +331,9 @@ async def handle_twilio(ws):
 
     done_flag = False
     stopped_flag = False
-    menu_task: asyncio.Task | None = None
-    followup_task: asyncio.Task | None = None
-    email_timeout_task: asyncio.Task | None = None
-
+    menu_task: asyncio.Task | None = None           # generic menu task (used for welcome scheduling)
+    followup_task: asyncio.Task | None = None       # menu-after-answer watcher
     current_tts_label = ""  # "welcome_menu" | "answer:*" | "menu" | "goodbye" | "fallback" | ""
-
-    # simple state
-    awaiting_email = False
-    email_context = None  # "pricing" or "pilot"
 
     async def pcm_iter():
         while True:
@@ -371,6 +360,7 @@ async def handle_twilio(ws):
         if not text or stopped_flag:
             return asyncio.create_task(asyncio.sleep(0))  # dummy task
 
+        # cancel current TTS (barge-in safe)
         if speak_task and not speak_task.done():
             speak_task.cancel()
             try: await speak_task
@@ -396,101 +386,64 @@ async def handle_twilio(ws):
         speak_task = asyncio.create_task(_run())
         return speak_task
 
-    def cancel_task(t: asyncio.Task | None):
-        if t and not t.done():
-            t.cancel()
+    def cancel_menu_task():
+        nonlocal menu_task
+        if menu_task and not menu_task.done():
+            menu_task.cancel()
+        menu_task = None
+
+    def cancel_followup_task():
+        nonlocal followup_task
+        if followup_task and not followup_task.done():
+            followup_task.cancel()
+        followup_task = None
 
     def schedule_menu_after_answer(answer_task: asyncio.Task, delay_ms: int = 1200):
+        """Wait for THIS answer to finish; after a quiet gap, speak the menu if idle."""
         nonlocal followup_task
-        cancel_task(followup_task)
+        cancel_followup_task()
+
         async def _watch():
             try:
+                # Wait for the specific answer task to finish (naturally, not canceled)
                 try:
                     await answer_task
                 except asyncio.CancelledError:
-                    return
+                    return  # the answer got canceled (barge-in) -> don't prompt
+
+                # quiet gap
                 await asyncio.sleep(delay_ms / 1000.0)
-                if not (stopped_flag or done_flag) and current_tts_label == "" and not awaiting_email:
+
+                # Only speak menu if still connected, not done, and nothing else is speaking
+                if not (stopped_flag or done_flag) and current_tts_label == "":
                     await speak(menu_text(), label="menu")
             except asyncio.CancelledError:
                 return
+
         followup_task = asyncio.create_task(_watch())
 
-    def start_email_timeout(seconds: float = 12.0):
-        nonlocal email_timeout_task
-        cancel_task(email_timeout_task)
-        async def _wait():
-            try:
-                await asyncio.sleep(seconds)
-                if not (stopped_flag or done_flag) and awaiting_email and current_tts_label == "":
-                    await speak("What’s the best email to reach you?", label="email_reprompt")
-            except asyncio.CancelledError:
-                return
-        email_timeout_task = asyncio.create_task(_wait())
-
-    async def confirm_and_menu(captured_email: str):
-        nonlocal awaiting_email, email_context
-        awaiting_email = False
-        email_context = None
-        cancel_task(email_timeout_task)
-        await speak(f"Got it. We’ll email you at {captured_email}.", label="email_confirm")
-        # after confirm, follow normal menu loop
-        await asyncio.sleep(1.0)
-        if not (stopped_flag or done_flag):
-            await speak(menu_text(), label="menu")
-
     async def handle_user(text: str):
-        nonlocal done_flag, awaiting_email, email_context
+        nonlocal done_flag
         if done_flag or stopped_flag: return
-
-        # If we're waiting for an email, try to capture it first.
-        if awaiting_email:
-            m = EMAIL_RE.search(text)
-            if m:
-                await confirm_and_menu(m.group(0))
-                return
-            # Also allow the user to bail out
-            if classify_intent_or_none(text) == "none":
-                done_flag = True
-                cancel_task(email_timeout_task)
-                await speak(GOODBYE, label="goodbye")
-                return
-            # Otherwise ignore non-emails here (no menu); the timeout will reprompt.
-            print("EMAIL ▶ not found in utterance")
-            return
 
         intent = classify_intent_or_none(text)
         print("INTENT ▶", intent)
 
         if intent == "none":
             done_flag = True
-            cancel_task(followup_task)
+            cancel_menu_task(); cancel_followup_task()
             await speak(GOODBYE, label="goodbye")
             return
 
         if intent in RESPONSES and intent != "fallback":
-            cancel_task(followup_task)
-            # Speak the answer
+            cancel_menu_task(); cancel_followup_task()
             ans_task = await speak(RESPONSES[intent], label=f"answer:{intent}")
-
-            # If this path requests an email, go into capture mode; do NOT schedule menu yet
-            if intent in ("pricing", "pilot"):
-                awaiting_email = True
-                email_context = intent
-                # when the answer finishes, start the email timeout
-                async def _after_answer():
-                    try:
-                        await ans_task
-                        start_email_timeout(12.0)
-                    except asyncio.CancelledError:
-                        pass
-                asyncio.create_task(_after_answer())
-            else:
-                # normal intents → menu after the answer
-                schedule_menu_after_answer(ans_task, 1200)
+            # schedule menu ONLY after the answer finishes
+            schedule_menu_after_answer(ans_task, 1200)
             return
 
-        # fallback: offer choices (acts like menu)
+        # fallback → menu-like text; treat it as a standalone prompt (no followup)
+        cancel_menu_task(); cancel_followup_task()
         await speak(RESPONSES["fallback"], label="fallback")
 
     async def brain():
@@ -507,12 +460,12 @@ async def handle_twilio(ws):
         async for item in deepgram_stream(pcm_iter):
             if done_flag or stopped_flag: break
 
+            # speech activity
             if isinstance(item, tuple) and len(item) == 2 and item[0] == "__EVENT__":
                 ev = item[1]
                 if ev == "SpeechStarted":
-                    cancel_task(menu_task)
-                    cancel_task(followup_task)
-                    # don't interrupt the initial welcome+menu
+                    # cancel menu prompts; don't interrupt initial welcome_menu
+                    cancel_menu_task()
                     if current_tts_label not in ("welcome_menu",):
                         if speak_task and not speak_task.done():
                             speak_task.cancel()
@@ -568,8 +521,11 @@ async def handle_twilio(ws):
                 print("WS ▶ stop")
                 stopped_flag = True
                 conn_open = False
-                for t in (menu_task, followup_task, email_timeout_task, speak_task, brain_task):
-                    cancel_task(t)
+                cancel_menu_task(); cancel_followup_task()
+                if speak_task and not speak_task.done():
+                    speak_task.cancel()
+                    try: await speak_task
+                    except asyncio.CancelledError: pass
                 break
 
     except Exception as e:
@@ -577,8 +533,14 @@ async def handle_twilio(ws):
     finally:
         conn_open = False
         await inbound_q.put(None)
-        for t in (menu_task, followup_task, email_timeout_task, speak_task):
-            cancel_task(t)
+        if speak_task and not speak_task.done():
+            speak_task.cancel()
+            try: await speak_task
+            except asyncio.CancelledError: pass
+        if menu_task and not menu_task.done():
+            menu_task.cancel()
+        if followup_task and not followup_task.done():
+            followup_task.cancel()
         try:
             await asyncio.wait_for(brain_task, timeout=2)
         except Exception:
