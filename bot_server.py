@@ -96,21 +96,35 @@ CHOICE_SYNONYMS = {
 
 # common ASR sound-alikes we saw / expect
 SOUNDA_LIKE = {
+    # pilot-ish
     "violet": "pilot",
     "violent": "pilot",
     "silo": "pilot",
     "pylet": "pilot",
+    "pilate": "pilot",
     "pilot": "pilot",
+    "kylas": "pilot",
+    "kyla": "pilot",
+    "kaila": "pilot",
+    "kyle": "pilot",
+    "pylot": "pilot",
+
+    # program
     "program": "program",
     "doggroom": "program",
-    "doggroom.": "program",
     "doggroomer": "program",
     "dawgroom": "program",
+
+    # pricing
     "prizing": "pricing",
     "prise": "price",
     "prices": "pricing",
+
+    # hours
     "ours": "hours",
     "hour": "hours",
+
+    # privacy
     "privacy": "privacy",
     "private": "privacy",
     "secure": "privacy",
@@ -142,14 +156,18 @@ def _soft_match_intent(text: str) -> str | None:
     tokens = [_soft_map_token(w) for w in t.split()]
     joined = " ".join(tokens)
 
-    # phrase heuristics: "pilot program" often misheard; look for 'program' near pilot-like
+    # Heuristic 1: lone "program" (or dominant "program") → pilot
+    if "program" in tokens and len(tokens) <= 3:
+        return "pilot"
+
+    # Heuristic 2: "program" near anything that sounds like "pilot"
     if "program" in tokens:
-        # if any token near "pilot"
         for w in tokens:
-            if _similar(w, "pilot") >= 0.75:
+            # lower the threshold a bit; short words get noisy
+            if _similar(w, "pilot") >= 0.60:
                 return "pilot"
 
-    # fuzzy compare against synonyms
+    # Fuzzy compare against synonyms
     best_intent, best_score = None, 0.0
     for intent, syns in CHOICE_SYNONYMS.items():
         for syn in syns:
@@ -157,16 +175,21 @@ def _soft_match_intent(text: str) -> str | None:
             if score > best_score:
                 best_intent, best_score = intent, score
 
-    # threshold tuned for short noisy phrases
-    if best_score >= 0.78:
+    # threshold tuned for short/noisy phrases
+    if best_score >= 0.75:
         return best_intent
 
-    # final backstop: single-word exacts after soundalike map
+    # Final backstop: single-token exacts after soundalike map
     for intent, syns in CHOICE_SYNONYMS.items():
         if any(tok in syns for tok in tokens):
             return intent
 
+    # Extra backstop: literal 'program' anywhere → pilot
+    if "program" in tokens:
+        return "pilot"
+
     return None
+
 
 def classify_intent_or_none(text: str) -> str:
     t = _strip_fillers(text or "")
@@ -282,9 +305,11 @@ async def deepgram_stream(pcm_iter):
                     # core menu
                     "NeuroMed","overview","privacy","pricing","pilot","pilot program","hours","start",
                     "trial","demo","evaluation","schedule","appointment",
-                    # common mishears -> steer decoding
-                    "violet","violent","silo","program","highlights","features"
+                    # mishears / steer decoding
+                    "violet","violent","silo","pilate","pylot","kyla","kylas","kaila","kyle",
+                    "program","highlights","features"
                 ]
+
             }))
         except Exception as e:
             print("DG CONFIG WARN ▶", repr(e))
