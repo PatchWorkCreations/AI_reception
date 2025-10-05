@@ -62,12 +62,10 @@ RX = lambda p: re.compile(p, re.I)
 HELLO_RE   = RX(r"\b(hello|hi|hey|good\s*(morning|afternoon|evening)|yo)\b")
 THANKS_RE  = RX(r"\b(thanks?|thank\s*you|that'?s\s*all|nothing\s*else|i'?m\s*good|we'?re\s*good)\b")
 INTENT_NONE = RX(r"\b(none|finish|end|no(?:\s+thanks|\s+thank\s*you)?)\b")
-# put near your other regex helpers
+# phonetic "pilot"
 PILOT_PHONETIC = RX(r"\bp(?:y|i|ai|ee)?l(?:o|a)?t(?:\s+pro(?:g|gr|gram)?)?\b")
 
 # Primary patterns
-
-
 INTENTS = [
     ("overview", RX(
         r"\b(over\s*view|overview|what\s+is|tell\s+me\s+more|how\s+does\s+it\s+work|"
@@ -108,7 +106,7 @@ SOUNDA_LIKE = {
     "kaila": "pilot",
     "kyle": "pilot",
     "pylot": "pilot",
-    "bogdan": "pilot",   # surgical mapping based on your logs
+    "bogdan": "pilot",
     # program
     "program": "program",
     "doggroom": "program",
@@ -179,7 +177,7 @@ def classify_intent_or_none(text: str) -> str:
     if not t:
         return "fallback"
 
-    # NEW: strong early hook for "pilot" even with mishears
+    # strong early hook for "pilot" even with mishears
     if PILOT_PHONETIC.search(t.lower()):
         return "pilot"
 
@@ -270,26 +268,25 @@ async def deepgram_stream(pcm_iter):
     async with websockets.connect(url, extra_headers=headers, max_size=2**20) as dg:
         try:
             await dg.send(json.dumps({
-            "type": "Configure",
-            "keywords": [
-                "NeuroMed","overview","privacy","pricing","pilot","pilot program","hours","start",
-                "trial","demo","evaluation","schedule","appointment",
-                "violet","violent","silo","pilate","pylot","kyla","kylas","kaila","kyle",
-                "program","highlights","features","email","address",
-                "neuromed","neuro med","neuro meda","neuromate","neuro net","narrow med","new roomed",
-                "pylet","pile it","pylot program","pilots","pilot test","pilot run","pilot project",
-                "pillow","bilot","biolet","vilo","file it","pilotage","pilotage program",
-                "trial run","try out","free trial","evaluation program","assessment","orientation",
-                "schedule","scheduled","appointment","booking","book","demo day","demo session",
-                "overview video","introduction","about","info","information","details","summary",
-                "features","functions","capabilities","benefits","highlights","what it does",
-                "how it works","how to start","get started","begin","beginner","start now",
-                "pricing plan","plans","subscription","membership","cost","fee","payment",
-                "hours","working hours","time","open","availability","support hours",
-                "email address","email us","send email","contact","message","reach out"
-            ]
-        }))
-
+                "type": "Configure",
+                "keywords": [
+                    "NeuroMed","overview","privacy","pricing","pilot","pilot program","hours","start",
+                    "trial","demo","evaluation","schedule","appointment",
+                    "violet","violent","silo","pilate","pylot","kyla","kylas","kaila","kyle",
+                    "program","highlights","features","email","address",
+                    "neuromed","neuro med","neuro meda","neuromate","neuro net","narrow med","new roomed",
+                    "pylet","pile it","pylot program","pilots","pilot test","pilot run","pilot project",
+                    "pillow","bilot","biolet","vilo","file it","pilotage","pilotage program",
+                    "trial run","try out","free trial","evaluation program","assessment","orientation",
+                    "schedule","scheduled","appointment","booking","book","demo day","demo session",
+                    "overview video","introduction","about","info","information","details","summary",
+                    "features","functions","capabilities","benefits","highlights","what it does",
+                    "how it works","how to start","get started","begin","beginner","start now",
+                    "pricing plan","plans","subscription","membership","cost","fee","payment",
+                    "hours","working hours","time","open","availability","support hours",
+                    "email address","email us","send email","contact","message","reach out"
+                ]
+            }))
         except Exception as e:
             print("DG CONFIG WARN ▶", repr(e))
 
@@ -344,7 +341,7 @@ async def deepgram_stream(pcm_iter):
         finally:
             await feed_task
 
-# --------- Twilio WS Server with email capture state ---------
+# --------- Twilio WS Server with email capture + UX guards ---------
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 _NUMBER_WORDS = {
@@ -367,7 +364,6 @@ def _word_numbers_to_digits(tokens):
 
 _SP_OK = {"at":"@", "dot":".", "period":".", "underscore":"_", "dash":"-", "hyphen":"-", "plus":"+"}
 
-
 def normalize_spoken_email(text: str) -> str | None:
     t = re.sub(r"[^\w\s@.+-]", " ", text.lower())
     toks = [w for w in t.split() if w]
@@ -388,7 +384,6 @@ def normalize_spoken_email(text: str) -> str | None:
     s = s.strip()
     return s if EMAIL_RE.fullmatch(s or "") else None
 
-
 async def handle_twilio(ws):
     if ws.path not in ("/ws/twilio",):
         await ws.close(code=1008, reason="Unexpected path"); return
@@ -405,12 +400,14 @@ async def handle_twilio(ws):
     menu_task: asyncio.Task | None = None
     followup_task: asyncio.Task | None = None
     email_timeout_task: asyncio.Task | None = None
+    silence_nudge_task: asyncio.Task | None = None
 
-    current_tts_label = ""  # "welcome_menu" | "answer:*" | "menu" | "goodbye" | "fallback" | ""
+    current_tts_label = ""  # "welcome_menu" | "answer:*" | "menu" | "goodbye" | "fallback" | "email_reprompt" | ""
 
     # simple state
     awaiting_email = False
     email_context = None  # "pricing" or "pilot"
+    email_nudged = False  # one-time gentle nudge while awaiting email
 
     async def pcm_iter():
         while True:
@@ -430,6 +427,22 @@ async def handle_twilio(ws):
             return True
         except (websockets.exceptions.ConnectionClosedOK, websockets.exceptions.ConnectionClosedError):
             conn_open = False; return False
+
+    def cancel_task(t: asyncio.Task | None):
+        if t and not t.done():
+            t.cancel()
+
+    def schedule_silence_nudge(delay_sec: float = 7.0):
+        nonlocal silence_nudge_task
+        cancel_task(silence_nudge_task)
+        async def _nudge():
+            try:
+                await asyncio.sleep(delay_sec)
+                if not (stopped_flag or done_flag) and current_tts_label == "":
+                    await speak("You can say overview, pricing, pilot programs, hours, or how to get started.", label="menu")
+            except asyncio.CancelledError:
+                return
+        silence_nudge_task = asyncio.create_task(_nudge())
 
     async def speak(text: str, label: str = "tts") -> asyncio.Task:
         nonlocal speak_task, current_tts_label
@@ -458,13 +471,12 @@ async def handle_twilio(ws):
             finally:
                 if current_tts_label == label:
                     current_tts_label = ""
+                # after soft prompts, schedule a gentle nudge
+                if label in ("menu", "fallback", "email_reprompt"):
+                    schedule_silence_nudge(7.0)
 
         speak_task = asyncio.create_task(_run())
         return speak_task
-
-    def cancel_task(t: asyncio.Task | None):
-        if t and not t.done():
-            t.cancel()
 
     def schedule_menu_after_answer(answer_task: asyncio.Task, delay_ms: int = 1200):
         nonlocal followup_task
@@ -495,9 +507,10 @@ async def handle_twilio(ws):
         email_timeout_task = asyncio.create_task(_wait())
 
     async def confirm_and_menu(captured_email: str):
-        nonlocal awaiting_email, email_context
+        nonlocal awaiting_email, email_context, email_nudged
         awaiting_email = False
         email_context = None
+        email_nudged = False
         cancel_task(email_timeout_task)
         await speak(f"Got it. We’ll email you at {captured_email}.", label="email_confirm")
         # after confirm, follow normal menu loop
@@ -506,7 +519,7 @@ async def handle_twilio(ws):
             await speak(menu_text(), label="menu")
 
     async def handle_user(text: str):
-        nonlocal done_flag, awaiting_email, email_context
+        nonlocal done_flag, awaiting_email, email_context, email_nudged
         if done_flag or stopped_flag: return
 
         # If we're waiting for an email, try to capture it first.
@@ -528,9 +541,13 @@ async def handle_twilio(ws):
                 return
 
             print("EMAIL ▶ not found in utterance")
+
+            # One gentle hint if they spoke something that's not an email
+            if not email_nudged and current_tts_label == "":
+                email_nudged = True
+                await speak("No rush — just your email address is perfect.", label="email_reprompt")
+                start_email_timeout(12.0)
             return
-
-
 
         intent = classify_intent_or_none(text)
         print("INTENT ▶", intent)
@@ -550,6 +567,7 @@ async def handle_twilio(ws):
             if intent in ("pricing", "pilot"):
                 awaiting_email = True
                 email_context = intent
+                email_nudged = False
                 # when the answer finishes, start the email timeout
                 async def _after_answer():
                     try:
@@ -585,17 +603,20 @@ async def handle_twilio(ws):
                 if ev == "SpeechStarted":
                     cancel_task(menu_task)
                     cancel_task(followup_task)
-                    if current_tts_label not in ("welcome_menu",):
+                    cancel_task(silence_nudge_task)
+
+                    # Only cancel "soft" prompts; do NOT cancel main answers.
+                    if current_tts_label in ("menu", "fallback", "email_reprompt"):
                         if speak_task and not speak_task.done():
                             speak_task.cancel()
                             try: await speak_task
                             except asyncio.CancelledError: pass
-                    # ⬅️ If we're waiting for an email, reset the reprompt timer so we don't barge in
+
+                    # If we're waiting for an email, reset the reprompt timer so we don't barge in mid-speech.
                     if awaiting_email:
                         cancel_task(email_timeout_task)
                         start_email_timeout(12.0)
-                continue
-
+                continue  # <—— important so we don't parse events as transcripts
 
             utter, is_final = item
             if not utter: continue
@@ -630,6 +651,19 @@ async def handle_twilio(ws):
 
                 # Say full welcome + menu immediately so callers know the options
                 await speak(WELCOME_MENU, label="welcome_menu")
+                # Schedule a gentle nudge if they don't speak
+                # (will be canceled the moment SpeechStarted fires, or after any soft prompt)
+                # Start it now so silence doesn't feel like the bot died.
+                # Note: welcome_menu is a "hard" prompt, so we don't barge-in cancel it.
+                # We schedule the nudge after it finishes automatically via speak() for soft prompts,
+                # but for welcome we trigger it explicitly:
+                # (Delay starts now; if they speak, SpeechStarted cancels it.)
+                # Slightly longer delay since they've just heard the options.
+                async def _after_welcome():
+                    # give welcome a breath to finish
+                    await asyncio.sleep(0.8)
+                    schedule_silence_nudge(7.0)
+                asyncio.create_task(_after_welcome())
 
             elif ev == "media":
                 payload_b64 = data["media"]["payload"]
@@ -645,7 +679,7 @@ async def handle_twilio(ws):
                 print("WS ▶ stop")
                 stopped_flag = True
                 conn_open = False
-                for t in (menu_task, followup_task, email_timeout_task, speak_task, brain_task):
+                for t in (menu_task, followup_task, email_timeout_task, speak_task, brain_task, silence_nudge_task):
                     cancel_task(t)
                 break
 
@@ -654,7 +688,7 @@ async def handle_twilio(ws):
     finally:
         conn_open = False
         await inbound_q.put(None)
-        for t in (menu_task, followup_task, email_timeout_task, speak_task):
+        for t in (menu_task, followup_task, email_timeout_task, speak_task, silence_nudge_task):
             cancel_task(t)
         try:
             await asyncio.wait_for(brain_task, timeout=2)
