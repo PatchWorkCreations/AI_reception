@@ -49,8 +49,7 @@ RESPONSES = {
         "If you share your time zone, I’ll find a time that works best for you."
     ),
     "start": (
-        "Awesome! Let’s get you started. "
-        "Can I grab your name and best email so we can send your next steps and a short demo link?"
+        "Awesome! Just head over to neuromedai.org and sign up as one of our beta testers — see you there!"
     ),
     "fallback": menu_text(),
 }
