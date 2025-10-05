@@ -17,7 +17,7 @@ ELEVEN_VOICE   = os.getenv("ELEVENLABS_VOICE_ID", "Bella")
 
 # OpenAI model + timeouts (fast + cheap)
 OPENAI_MODEL         = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_TIMEOUT_S     = float(os.getenv("OPENAI_TIMEOUT_S", "0.35"))
+OPENAI_TIMEOUT_S     = float(os.getenv("OPENAI_TIMEOUT_S", "0.6"))  # safer than 0.35
 OPENAI_ENABLE        = bool(OPENAI_API_KEY)
 
 # --------- Menu content ---------
@@ -67,6 +67,7 @@ RX = lambda p: re.compile(p, re.I)
 HELLO_RE   = RX(r"\b(hello|hi|hey|good\s*(morning|afternoon|evening)|yo)\b")
 THANKS_RE  = RX(r"\b(thanks?|thank\s*you|that'?s\s*all|nothing\s*else|i'?m\s*good|we'?re\s*good)\b")
 INTENT_NONE = RX(r"\b(none|finish|end|no(?:\s+thanks|\s+thank\s*you)?)\b")
+# phonetic "pilot"
 PILOT_PHONETIC = RX(r"\bp(?:y|i|ai|ee)?l(?:o|a)?t(?:\s+pro(?:g|gr|gram)?)?\b")
 
 # Primary patterns
@@ -157,10 +158,7 @@ def classify_intent_or_none(text: str) -> str:
     if bare in {"overview","privacy","pricing","pilot","hours","start"}: return bare
     return "fallback"
 
-
 # ===== OpenAI micro NLU (parallel, tiny, cached) =====
-# We call this ONLY on final transcripts – small prompt, low temp, strict JSON.
-
 _openai_cache: dict[str, dict] = {}
 OPENAI_CACHE_MAX = 200
 
@@ -184,10 +182,6 @@ def _intent_system_prompt():
     )
 
 async def call_openai_nlu(text: str) -> dict:
-    """
-    Returns {"intent": <enum>, "email": <str|None>, "confidence": float}
-    If OPENAI is disabled or any error/timeout happens, returns {}.
-    """
     if not OPENAI_ENABLE or not text.strip():
         return {}
 
@@ -196,14 +190,11 @@ async def call_openai_nlu(text: str) -> dict:
     if cached:
         return cached
 
-    # super small chat completion with JSON response
     url = "https://api.openai.com/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
-    user_msg = text.strip()
-
     payload = {
         "model": OPENAI_MODEL,
         "temperature": 0.1,
@@ -211,7 +202,7 @@ async def call_openai_nlu(text: str) -> dict:
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": _intent_system_prompt()},
-            {"role": "user", "content": user_msg},
+            {"role": "user", "content": text.strip()},
         ],
     }
 
@@ -219,7 +210,6 @@ async def call_openai_nlu(text: str) -> dict:
         async with httpx.AsyncClient(timeout=httpx.Timeout(OPENAI_TIMEOUT_S)) as client:
             resp = await client.post(url, headers=headers, json=payload)
             if resp.status_code != 200:
-                # print once to logs for visibility; degrade gracefully
                 print("OPENAI ERR ▶", resp.status_code, resp.text[:200])
                 return {}
             data = resp.json()
@@ -235,10 +225,8 @@ async def call_openai_nlu(text: str) -> dict:
             _cache_set(key, out)
             return out
     except Exception as e:
-        # Timeout / network / parse issues → soft fail
         print("OPENAI EXC ▶", repr(e))
         return {}
-
 
 # --------- helpers ---------
 def b64_to_bytes(s: str) -> bytes:
@@ -400,19 +388,40 @@ def _word_numbers_to_digits(tokens):
 
 _SP_OK = {"at":"@", "dot":".", "period":".", "underscore":"_", "dash":"-", "hyphen":"-", "plus":"+"}
 
+# provider split fixes + common ASR endings
+_PROVIDER_FIXES = [
+    (r"\bg\s*mail\b", "gmail"),
+    (r"\bout\s*look\b", "outlook"),
+    (r"\bproton\s*mail\b", "protonmail"),
+    (r"\bhot\s*mail\b", "hotmail"),
+    (r"\bicloud\b", "icloud"),
+    (r"\byahoo\b", "yahoo"),
+]
+
 def normalize_spoken_email(text: str) -> str | None:
-    t = re.sub(r"[^\w\s@.+-]", " ", text.lower())
+    t = re.sub(r"[^\w\s@.+-]", " ", (text or "").lower())
+
+    # collapse split providers BEFORE removing spaces
+    for pat, rep in _PROVIDER_FIXES:
+        t = re.sub(pat, rep, t)
+
     toks = [w for w in t.split() if w]
     toks = _word_numbers_to_digits(toks)
-    mapped = [ _SP_OK.get(w, w) for w in toks ]
+    mapped = [_SP_OK.get(w, w) for w in toks]
     s = " ".join(mapped)
+
+    # collapse around @ and .
     s = re.sub(r"\s*@\s*", "@", s)
     s = re.sub(r"\s*\.\s*", ".", s)
+
+    # remove residual spaces inside local/domain
     if "@" in s:
         local, _, domain = s.partition("@")
         local = re.sub(r"\s+", "", local)
         domain = re.sub(r"\s+", "", domain)
         s = f"{local}@{domain}"
+
+    # common ASR suffixes
     s = re.sub(r"\.come\b", ".com", s)
     s = re.sub(r"\.calm\b", ".com", s)
     s = re.sub(r"\.orgg\b", ".org", s)
@@ -437,12 +446,13 @@ async def handle_twilio(ws):
     email_timeout_task: asyncio.Task | None = None
     silence_nudge_task: asyncio.Task | None = None
 
-    current_tts_label = ""  # "welcome_menu" | "answer:*" | "menu" | "goodbye" | "fallback" | "email_reprompt" | ""
+    current_tts_label = ""  # "welcome_menu" | "answer:*" | "menu" | "goodbye" | "fallback" | "email_reprompt" | "nudge" | ""
 
     # simple state
     awaiting_email = False
     email_context = None  # "pricing" or "pilot"
     email_nudged = False  # one-time gentle nudge while awaiting email
+    email_buffer = ""     # accumulate partial email over multiple finals
 
     async def pcm_iter():
         while True:
@@ -473,14 +483,14 @@ async def handle_twilio(ws):
         async def _nudge():
             try:
                 await asyncio.sleep(delay_sec)
-                if not (stopped_flag or done_flag) and current_tts_label == "":
-                    await speak("You can say overview, pricing, pilot programs, hours, or how to get started.", label="menu")
+                if not (stopped_flag or done_flag) and current_tts_label == "" and not awaiting_email:
+                    await speak("You can say overview, pricing, pilot programs, hours, or how to get started.", label="nudge")
             except asyncio.CancelledError:
                 return
         silence_nudge_task = asyncio.create_task(_nudge())
 
     async def speak(text: str, label: str = "tts") -> asyncio.Task:
-        nonlocal speak_task, current_tts_label
+        nonlocal speak_task, current_tts_label, awaiting_email
         text = (text or "").strip()
         if not text or stopped_flag:
             return asyncio.create_task(asyncio.sleep(0))  # dummy
@@ -506,7 +516,8 @@ async def handle_twilio(ws):
             finally:
                 if current_tts_label == label:
                     current_tts_label = ""
-                if label in ("menu", "fallback", "email_reprompt"):
+                # Only schedule nudges when not waiting for email
+                if label in ("menu", "fallback", "email_reprompt", "nudge") and not awaiting_email:
                     schedule_silence_nudge(7.0)
 
         speak_task = asyncio.create_task(_run())
@@ -541,10 +552,11 @@ async def handle_twilio(ws):
         email_timeout_task = asyncio.create_task(_wait())
 
     async def confirm_and_menu(captured_email: str):
-        nonlocal awaiting_email, email_context, email_nudged
+        nonlocal awaiting_email, email_context, email_nudged, email_buffer
         awaiting_email = False
         email_context = None
         email_nudged = False
+        email_buffer = ""
         cancel_task(email_timeout_task)
         await speak(f"Got it. We’ll email you at {captured_email}.", label="email_confirm")
         await asyncio.sleep(1.0)
@@ -552,36 +564,44 @@ async def handle_twilio(ws):
             await speak(menu_text(), label="menu")
 
     async def handle_user(text: str):
-        nonlocal done_flag, awaiting_email, email_context, email_nudged
+        nonlocal done_flag, awaiting_email, email_context, email_nudged, email_buffer
         if done_flag or stopped_flag: return
 
         # -------- email capture path --------
         if awaiting_email:
-            # run OpenAI extractor in parallel, but don't wait if our regex hits
-            llm_task = asyncio.create_task(call_openai_nlu(text)) if OPENAI_ENABLE else None
+            # accumulate
+            if text:
+                email_buffer = (email_buffer + " " + text).strip()
+                if len(email_buffer) > 300:
+                    email_buffer = email_buffer[-300:]
 
-            spoken = normalize_spoken_email(text)
-            if spoken and EMAIL_RE.fullmatch(spoken):
-                await confirm_and_menu(spoken); return
+            # try buffer spoken-normalization
+            spoken_buf = normalize_spoken_email(email_buffer)
+            if spoken_buf and EMAIL_RE.fullmatch(spoken_buf):
+                await confirm_and_menu(spoken_buf); return
 
-            m = EMAIL_RE.search(text)
-            if m:
-                await confirm_and_menu(m.group(0)); return
+            # try current utterance literal regex
+            m_curr = EMAIL_RE.search(text or "")
+            if m_curr:
+                await confirm_and_menu(m_curr.group(0)); return
 
-            # fall back to LLM if quick enough
+            # LLM assist (fast, cached)
+            llm_task = asyncio.create_task(call_openai_nlu(email_buffer)) if OPENAI_ENABLE else None
             if llm_task:
                 try:
                     r = await asyncio.wait_for(llm_task, timeout=OPENAI_TIMEOUT_S)
-                    em = r.get("email") if isinstance(r, dict) else None
+                    em = (r or {}).get("email")
                     if em and EMAIL_RE.fullmatch(em):
                         await confirm_and_menu(em); return
                 except asyncio.TimeoutError:
                     pass
 
+            # allow exit
             if classify_intent_or_none(text) == "none":
                 done_flag = True
                 cancel_task(email_timeout_task)
                 await speak(GOODBYE, label="goodbye")
+                email_buffer = ""
                 return
 
             print("EMAIL ▶ not found in utterance")
@@ -599,7 +619,7 @@ async def handle_twilio(ws):
         if heuristic_intent == "fallback" and llm_task:
             try:
                 r = await asyncio.wait_for(llm_task, timeout=OPENAI_TIMEOUT_S)
-                li = r.get("intent")
+                li = (r or {}).get("intent")
                 if li in INTENT_ENUM and li != "fallback":
                     intent = li
             except asyncio.TimeoutError:
@@ -654,7 +674,7 @@ async def handle_twilio(ws):
                     cancel_task(followup_task)
                     cancel_task(silence_nudge_task)
                     # Only cancel soft prompts
-                    if current_tts_label in ("menu", "fallback", "email_reprompt"):
+                    if current_tts_label in ("menu", "fallback", "email_reprompt", "nudge"):
                         if speak_task and not speak_task.done():
                             speak_task.cancel()
                             try: await speak_task
@@ -662,7 +682,7 @@ async def handle_twilio(ws):
                     if awaiting_email:
                         cancel_task(email_timeout_task)
                         start_email_timeout(12.0)
-                continue
+                continue  # do not parse events as transcripts
 
             utter, is_final = item
             if not utter: continue
