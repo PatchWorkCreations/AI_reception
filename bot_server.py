@@ -22,21 +22,18 @@ def menu_text():
         "Which one would you like? You can also say 'none' to finish."
     )
 
-WELCOME_MENU = (
-    "Hey there! Welcome to NeuroMed AI — your kind and clever health assistant. "
-    + menu_text()
-)
+WELCOME = "Hey there! Welcome to NeuroMed AI — your kind and clever health assistant. "
+WELCOME_MENU = WELCOME + menu_text()
+GOODBYE = "Thank you! Don’t forget to visit neuromedai.org."
 
 RESPONSES = {
     "overview": (
-        "NeuroMed AI takes medical files — like discharge notes, lab results, and imaging reports — "
-        "and translates them into clear, human-friendly summaries. "
-        "You can even choose your tone: plain and simple, caregiver-gentle, faith-filled and encouraging, or crisp and clinical. "
-        "Because healthcare should speak your language."
+        "NeuroMed AI turns medical files like discharge notes, lab results, and imaging reports "
+        "into clear, human-friendly summaries. You can pick the tone: plain and simple, caregiver-gentle, "
+        "faith-filled and encouraging, or crisp and clinical."
     ),
     "privacy": (
-        "Your privacy is sacred to us. "
-        "All files are securely stored and never shared — ever. "
+        "Your privacy is sacred to us. All files are securely stored and never shared — ever. "
         "We’re HIPAA-conscious and heart-conscious."
     ),
     "pricing": (
@@ -58,15 +55,13 @@ RESPONSES = {
     "fallback": menu_text(),
 }
 
-GOODBYE = "Thank you! Don’t forget to visit neuromedai.org."
-
 # --------- Regex helpers ---------
 RX = lambda p: re.compile(p, re.I)
 HELLO_RE   = RX(r"\b(hello|hi|hey|good\s*(morning|afternoon|evening)|yo)\b")
 THANKS_RE  = RX(r"\b(thanks?|thank\s*you|that'?s\s*all|nothing\s*else|i'?m\s*good|we'?re\s*good)\b")
 INTENT_NONE = RX(r"\b(none|finish|end|no(?:\s+thanks|\s+thank\s*you)?)\b")
 
-# Primary patterns (still useful)
+# Primary patterns
 INTENTS = [
     ("overview", RX(
         r"\b(over\s*view|overview|what\s+is|tell\s+me\s+more|how\s+does\s+it\s+work|"
@@ -89,12 +84,11 @@ CHOICE_SYNONYMS = {
     "overview": {"overview","over view","what is","how it works","highlights","highlight","key features","capabilities","what can you do"},
     "privacy": {"privacy","private","security","secure","hipaa","gdpr","compliance","compliant","phi"},
     "pricing": {"pricing","price","prices","cost","how much","rates","fees","plans","tiers"},
-    "pilot":   {"pilot","pilot program","trial","poc","demo","evaluation","test drive"},
+    "pilot":   {"pilot","pilot program","trial","poc","demo","evaluation","test drive","program"},
     "hours":   {"hours","availability","available","open","close","schedule","appointment","appt","book"},
     "start":   {"get started","start","begin","sign up","setup","set up","how to get started"},
 }
 
-# common ASR sound-alikes we saw / expect
 SOUNDA_LIKE = {
     # pilot-ish
     "violet": "pilot",
@@ -108,22 +102,18 @@ SOUNDA_LIKE = {
     "kaila": "pilot",
     "kyle": "pilot",
     "pylot": "pilot",
-
     # program
     "program": "program",
     "doggroom": "program",
     "doggroomer": "program",
     "dawgroom": "program",
-
     # pricing
     "prizing": "pricing",
     "prise": "price",
     "prices": "pricing",
-
     # hours
     "ours": "hours",
     "hour": "hours",
-
     # privacy
     "privacy": "privacy",
     "private": "privacy",
@@ -141,7 +131,7 @@ def _soft_map_token(tok: str) -> str:
     return SOUNDA_LIKE.get(t, t)
 
 def _soft_match_intent(text: str) -> str | None:
-    """Fuzzy map utterance to one of our intents."""
+    """Fuzzy map utterance to one of our intents; returns None if uncertain."""
     t = _norm(text)
     if not t:
         return None
@@ -156,18 +146,17 @@ def _soft_match_intent(text: str) -> str | None:
     tokens = [_soft_map_token(w) for w in t.split()]
     joined = " ".join(tokens)
 
-    # Heuristic 1: lone "program" (or dominant "program") → pilot
+    # lone/short "program" → pilot
     if "program" in tokens and len(tokens) <= 3:
         return "pilot"
 
-    # Heuristic 2: "program" near anything that sounds like "pilot"
+    # "program" near anything like "pilot"
     if "program" in tokens:
         for w in tokens:
-            # lower the threshold a bit; short words get noisy
             if _similar(w, "pilot") >= 0.60:
                 return "pilot"
 
-    # Fuzzy compare against synonyms
+    # fuzzy compare against synonyms
     best_intent, best_score = None, 0.0
     for intent, syns in CHOICE_SYNONYMS.items():
         for syn in syns:
@@ -175,38 +164,31 @@ def _soft_match_intent(text: str) -> str | None:
             if score > best_score:
                 best_intent, best_score = intent, score
 
-    # threshold tuned for short/noisy phrases
     if best_score >= 0.75:
         return best_intent
 
-    # Final backstop: single-token exacts after soundalike map
+    # backstops
     for intent, syns in CHOICE_SYNONYMS.items():
         if any(tok in syns for tok in tokens):
             return intent
-
-    # Extra backstop: literal 'program' anywhere → pilot
     if "program" in tokens:
         return "pilot"
 
     return None
-
 
 def classify_intent_or_none(text: str) -> str:
     t = _strip_fillers(text or "")
     if not t:
         return "fallback"
 
-    # soft layer first
     soft = _soft_match_intent(t)
     if soft:
         return soft
 
-    # regex layer
     for name, rx in INTENTS:
         if rx.search(t):
             return name
 
-    # bare one-word choices
     bare = _norm(t)
     if bare in {"overview","privacy","pricing","pilot","hours","start"}:
         return bare
@@ -278,6 +260,12 @@ async def eleven_tts_stream_cached(text: str):
 
 # --------- Deepgram ASR ---------
 async def deepgram_stream(pcm_iter):
+    """
+    Yields:
+      - ("__EVENT__", "SpeechStarted") on speech start
+      - ("__EVENT__", "SpeechFinished") on speech end
+      - (text, is_final) for hypotheses
+    """
     if not DEEPGRAM_KEY:
         print("ASR WARN ▶ DEEPGRAM_API_KEY missing; ASR disabled.")
         return
@@ -297,19 +285,15 @@ async def deepgram_stream(pcm_iter):
     headers = [("Authorization", f"Token {DEEPGRAM_KEY}")]
 
     async with websockets.connect(url, extra_headers=headers, max_size=2**20) as dg:
-        # beefed-up keyword biasing (include mishears)
         try:
             await dg.send(json.dumps({
                 "type": "Configure",
                 "keywords": [
-                    # core menu
                     "NeuroMed","overview","privacy","pricing","pilot","pilot program","hours","start",
                     "trial","demo","evaluation","schedule","appointment",
-                    # mishears / steer decoding
                     "violet","violent","silo","pilate","pylot","kyla","kylas","kaila","kyle",
                     "program","highlights","features"
                 ]
-
             }))
         except Exception as e:
             print("DG CONFIG WARN ▶", repr(e))
@@ -341,9 +325,12 @@ async def deepgram_stream(pcm_iter):
                 except Exception:
                     continue
 
-                if isinstance(obj, dict) and obj.get("type") in {
-                    "Metadata","Warning","Error","Close","UtteranceEnd","SpeechStarted","SpeechFinished"
-                }:
+                # surface speech activity
+                t = obj.get("type")
+                if t in {"SpeechStarted", "SpeechFinished"}:
+                    yield ("__EVENT__", t); continue
+
+                if isinstance(obj, dict) and t in {"Metadata","Warning","Error","Close","UtteranceEnd"}:
                     continue
 
                 alts, is_final = [], bool(obj.get("is_final"))
@@ -368,17 +355,16 @@ async def deepgram_stream(pcm_iter):
                     continue
 
                 print(f"ASR{'(final)' if is_final else ''} ▶ {txt}")
-                yield txt, is_final
+                yield (txt, is_final)
                 last_emit = now
                 last_sent = txt
         finally:
             await feed_task
 
-# --------- Twilio WS Server with menu loop + fuzzy intents ---------
+# --------- Twilio WS Server with strict answer-then-menu ordering ---------
 async def handle_twilio(ws):
     if ws.path not in ("/ws/twilio",):
-        await ws.close(code=1008, reason="Unexpected path")
-        return
+        await ws.close(code=1008, reason="Unexpected path"); return
 
     print("WS ▶ Twilio connected.")
     inbound_q: asyncio.Queue[bytes] = asyncio.Queue()
@@ -389,18 +375,17 @@ async def handle_twilio(ws):
 
     done_flag = False
     stopped_flag = False
+    menu_task: asyncio.Task | None = None  # scheduled "ask menu after quiet"
 
     async def pcm_iter():
         while True:
             b = await inbound_q.get()
-            if b is None:
-                break
+            if b is None: break
             yield b
 
     async def send_pcm(pcm: bytes) -> bool:
         nonlocal conn_open, stream_sid
-        if not conn_open or not stream_sid:
-            return False
+        if not conn_open or not stream_sid: return False
         try:
             await ws.send(json.dumps({
                 "event": "media",
@@ -409,19 +394,19 @@ async def handle_twilio(ws):
             }))
             return True
         except (websockets.exceptions.ConnectionClosedOK, websockets.exceptions.ConnectionClosedError):
-            conn_open = False
-            return False
+            conn_open = False; return False
 
-    async def speak(text: str):
+    async def speak(text: str, label: str = "tts"):
         nonlocal speak_task
         text = (text or "").strip()
-        if not text or stopped_flag:
-            return
+        if not text or stopped_flag: return
+        # cancel current TTS (barge-in safe)
         if speak_task and not speak_task.done():
             speak_task.cancel()
             try: await speak_task
             except asyncio.CancelledError: pass
 
+        print(f"SAY ▶ {label}")
         async def _run():
             pre = 50 + int(random.uniform(-10, 15))
             await send_silence(send_pcm, max(pre, 20))
@@ -430,36 +415,59 @@ async def handle_twilio(ws):
                 if not ok: return
             post = 50 + int(random.uniform(-10, 15))
             await send_silence(send_pcm, max(post, 20))
-
         speak_task = asyncio.create_task(_run())
 
-    async def ask_menu():
-        await speak(menu_text())
+    async def ask_menu(immediate: bool = False):
+        if immediate:
+            await speak(menu_text(), label="menu")
+        else:
+            schedule_menu_after_quiet(1400)
+
+    def cancel_menu_task():
+        nonlocal menu_task
+        if menu_task and not menu_task.done():
+            menu_task.cancel()
+        menu_task = None
+
+    def schedule_menu_after_quiet(delay_ms: int = 1400):
+        nonlocal menu_task
+        cancel_menu_task()
+        async def _later():
+            try:
+                await asyncio.sleep(delay_ms / 1000.0)
+                if not (done_flag or stopped_flag):
+                    await speak(menu_text(), label="menu")
+            except asyncio.CancelledError:
+                return
+        menu_task = asyncio.create_task(_later())
 
     async def handle_user(text: str):
         nonlocal done_flag
-        if done_flag or stopped_flag:
-            return
+        if done_flag or stopped_flag: return
 
         intent = classify_intent_or_none(text)
         print("INTENT ▶", intent)
 
         if intent == "none":
             done_flag = True
-            await speak(GOODBYE)
+            cancel_menu_task()
+            await speak(GOODBYE, label="goodbye")
             return
 
         if intent in RESPONSES and intent != "fallback":
-            await speak(RESPONSES[intent])
-            await ask_menu()
+            cancel_menu_task()                # 1) stop any pending menu
+            await speak(RESPONSES[intent],    # 2) speak the answer
+                        label=f"answer:{intent}")
+            schedule_menu_after_quiet(1400)   # 3) only then schedule the menu
             return
 
-        # fallback → menu again
-        await speak(RESPONSES["fallback"])
+        # fallback → offer menu (scheduled, not immediate)
+        cancel_menu_task()
+        await speak(RESPONSES["fallback"], label="fallback")
+        # note: fallback text already *is* the menu text
 
     async def brain():
-        if not DEEPGRAM_KEY:
-            return
+        if not DEEPGRAM_KEY: return
         try:
             await asyncio.wait_for(first_media.wait(), timeout=20)
         except asyncio.TimeoutError:
@@ -469,11 +477,22 @@ async def handle_twilio(ws):
         pending_ts = 0.0
         FINAL_DEBOUNCE = 0.3
 
-        async for utter, is_final in deepgram_stream(pcm_iter):
-            if done_flag or stopped_flag:
-                break
-            if not utter:
+        async for item in deepgram_stream(pcm_iter):
+            if done_flag or stopped_flag: break
+
+            # speech activity
+            if isinstance(item, tuple) and len(item) == 2 and item[0] == "__EVENT__":
+                ev = item[1]
+                if ev == "SpeechStarted":
+                    cancel_menu_task()
+                    if speak_task and not speak_task.done():
+                        speak_task.cancel()
+                        try: await speak_task
+                        except asyncio.CancelledError: pass
                 continue
+
+            utter, is_final = item
+            if not utter: continue
             now = time.time()
 
             if is_final:
@@ -484,7 +503,6 @@ async def handle_twilio(ws):
                     pending_final = utter.strip()
                     pending_ts = now
 
-                # respond on sentence end or short-but-confident length
                 if re.search(r"[.!?…]\s*$", pending_final) or len(pending_final.split()) >= 2:
                     await handle_user(pending_final)
                     pending_final = None
@@ -503,7 +521,14 @@ async def handle_twilio(ws):
                 start_info = data.get("start", {}) or {}
                 stream_sid = start_info.get("streamSid")
                 print(f"WS ▶ start streamSid={stream_sid}")
-                asyncio.create_task(speak(WELCOME_MENU))
+                # schedule welcome/menu after a brief quiet window (not immediate)
+                def _schedule_welcome():
+                    async def later():
+                        await asyncio.sleep(0.9)
+                        if not stopped_flag:
+                            await speak(WELCOME_MENU, label="welcome")
+                    return asyncio.create_task(later())
+                menu_task = _schedule_welcome()
 
             elif ev == "media":
                 payload_b64 = data["media"]["payload"]
@@ -519,6 +544,7 @@ async def handle_twilio(ws):
                 print("WS ▶ stop")
                 stopped_flag = True
                 conn_open = False
+                cancel_menu_task()
                 if speak_task and not speak_task.done():
                     speak_task.cancel()
                     try: await speak_task
@@ -534,6 +560,8 @@ async def handle_twilio(ws):
             speak_task.cancel()
             try: await speak_task
             except asyncio.CancelledError: pass
+        if 'menu_task' in locals() and menu_task and not menu_task.done():
+            menu_task.cancel()
         try:
             await asyncio.wait_for(brain_task, timeout=2)
         except Exception:
