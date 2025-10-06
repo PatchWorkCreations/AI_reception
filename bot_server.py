@@ -403,7 +403,7 @@ def normalize_spoken_email(text: str) -> str | None:
         if m2: return m2.group(0)
     return None
 
-# --------- Twilio WS Server (FSM + single idle timer + guaranteed post-answer menu) ---------
+# --------- Twilio WS Server (FSM + idle timer + post-answer menu + echo guard) ---------
 
 STATE_IDLE            = "IDLE"            # waiting for user (can show menu, then nudge)
 STATE_ANSWERING       = "ANSWERING"       # speaking an answer
@@ -428,6 +428,14 @@ async def handle_twilio(ws):
     EMAIL_RP_COOLDOWN_S = 10.0
     IDLE_MENU_DELAY_S = 7.0
     NUDGE_DELAY_AFTER_MENU_S = 10.0
+
+    # guards (welcome echo)
+    WELCOME_GUARD_S = 3.0  # ignore obvious echoes for this long after welcome
+    welcome_guard_until = 0.0
+
+    # keyword helpers
+    MENU_KEYWORDS = {"overview","privacy","pricing","pilot","hours","start","get started","how to get started"}
+    STOPLIST_PHRASES = {"welcome to", "thank you for calling", "thanks for calling"}
 
     # voice/queue controls
     speak_task: asyncio.Task | None = None
@@ -454,6 +462,7 @@ async def handle_twilio(ws):
             b = await inbound_q.get()
             if b is None: break
             yield b
+
     async def send_pcm(pcm: bytes) -> bool:
         nonlocal conn_open, stream_sid
         if not conn_open or not stream_sid: return False
@@ -545,7 +554,6 @@ async def handle_twilio(ws):
                     return
                 now = time.time()
                 if now - last_prompt["menu"] < MENU_COOLDOWN_S:
-                    # respect cooldown; resume idle cadence for nudges
                     restart_idle_timer(NUDGE_DELAY_AFTER_MENU_S)
                     return
                 await speak(menu_text(), label="menu")
@@ -563,7 +571,7 @@ async def handle_twilio(ws):
         state = STATE_IDLE
         cancel_task(email_timeout_task)
         await speak(f"Got it. We’ll email you at {captured_email}.", label="email_confirm")
-        schedule_menu_after_answer(1.0)  # brief confirm → one menu
+        schedule_menu_after_answer(1.0)
         restart_idle_timer(IDLE_MENU_DELAY_S)
 
     # ---- User handling ----
@@ -573,6 +581,12 @@ async def handle_twilio(ws):
 
         last_user_ts = time.time()
         cancel_task(idle_timer_task)
+
+        # soft ignore ultra-short non-intents that look like echoes
+        norm = (text or "").lower().strip()
+        if len(norm.split()) < 3 and not any(kw in norm for kw in MENU_KEYWORDS):
+            if norm.startswith(tuple(STOPLIST_PHRASES)):
+                return
 
         # EMAIL FLOW
         if state == STATE_AWAITING_EMAIL:
@@ -604,7 +618,7 @@ async def handle_twilio(ws):
                 return
             return
 
-        # INTENT FLOW
+    # ---- Intent flow (separate to keep handle_user concise) ----
         heuristic_intent = classify_intent_or_none(text)
         intent = heuristic_intent
         if OPENAI_ENABLE and heuristic_intent == "fallback":
@@ -634,9 +648,7 @@ async def handle_twilio(ws):
                 start_email_timeout(12.0)
             else:
                 state = STATE_IDLE
-                # guarantee one menu shortly after answer (if still idle)
                 schedule_menu_after_answer(1.2)
-                # backup idle timer in case cooldown blocks the menu
                 restart_idle_timer(IDLE_MENU_DELAY_S)
             return
 
@@ -647,7 +659,7 @@ async def handle_twilio(ws):
         schedule_menu_after_answer(1.2)
         restart_idle_timer(IDLE_MENU_DELAY_S)
 
-    # ---- Brain: ASR → handler with barge-in guard ----
+    # ---- Brain: ASR → handler with barge-in & welcome-echo guard ----
     async def brain():
         if not DEEPGRAM_KEY: return
         try:
@@ -682,9 +694,23 @@ async def handle_twilio(ws):
                     pending_final = utter.strip()
                     pending_ts = now
 
-                if re.search(r"[.!?…]\s*$", pending_final) or len(pending_final.split()) >= 2:
-                    await handle_user(pending_final)
-                    pending_final = None
+                # --- STRONGER FINAL GATE ---
+                if pending_final:
+                    words = pending_final.split()
+                    normalized = pending_final.lower().strip()
+
+                    # 3a) ignore likely echoes during welcome guard
+                    if time.time() < welcome_guard_until:
+                        if any(normalized.startswith(p) for p in STOPLIST_PHRASES):
+                            pending_final = None
+                            continue
+
+                    has_punct = bool(re.search(r"[.!?…]\s*$", pending_final))
+                    has_menu_kw = any(kw in normalized for kw in MENU_KEYWORDS)
+
+                    if has_punct or has_menu_kw or len(words) >= 3:
+                        await handle_user(pending_final)
+                        pending_final = None
 
         if not stopped_flag and pending_final:
             await handle_user(pending_final)
@@ -704,6 +730,10 @@ async def handle_twilio(ws):
                 # Welcome counts as a "menu" for cooldown purposes
                 await speak(WELCOME_MENU, label="welcome_menu")
                 last_prompt["menu"] = time.time()
+
+                # Guard against ASR hearing our own welcome for a moment
+                welcome_guard_until = time.time() + WELCOME_GUARD_S
+
                 restart_idle_timer(IDLE_MENU_DELAY_S)
 
             elif ev == "media":
