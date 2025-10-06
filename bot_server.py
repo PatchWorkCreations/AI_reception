@@ -611,10 +611,14 @@ async def handle_twilio(ws):
         email_nudged = False
         email_buffer = ""
         cancel_task(email_timeout_task)
-        await speak(f"Got it. We’ll email you at {captured_email}.", label="email_confirm")
-        await asyncio.sleep(1.0)
-        if not (stopped_flag or done_flag):
-            await speak(menu_text(), label="menu")
+
+        # Speak the confirmation and wait for it to finish (so it doesn't get canceled by the next speak)
+        confirm_task = await speak(f"Got it. We’ll email you at {captured_email}.", label="email_confirm")
+
+        # Use the same scheduling guard we use after answers:
+        # waits for confirm to finish, then (if idle and not awaiting email) speaks the menu after ~1s.
+        schedule_menu_after_answer(confirm_task, delay_ms=1000)
+
 
     async def handle_user(text: str):
         nonlocal done_flag, awaiting_email, email_context, email_nudged, email_buffer
