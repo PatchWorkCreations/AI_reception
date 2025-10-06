@@ -403,12 +403,11 @@ def normalize_spoken_email(text: str) -> str | None:
         if m2: return m2.group(0)
     return None
 
-# --------- Twilio WS Server (now with FSM + single idle timer + cool-downs) ---------
+# --------- Twilio WS Server (FSM + single idle timer + guaranteed post-answer menu) ---------
 
-# Small finite states to avoid races
-STATE_IDLE            = "IDLE"             # waiting for user (can show menu once, then nudge)
-STATE_ANSWERING       = "ANSWERING"        # speaking an answer
-STATE_AWAITING_EMAIL  = "AWAITING_EMAIL"   # waiting for email (reprompts gated)
+STATE_IDLE            = "IDLE"            # waiting for user (can show menu, then nudge)
+STATE_ANSWERING       = "ANSWERING"       # speaking an answer
+STATE_AWAITING_EMAIL  = "AWAITING_EMAIL"  # waiting for email
 STATE_ENDED           = "ENDED"
 
 async def handle_twilio(ws):
@@ -427,13 +426,13 @@ async def handle_twilio(ws):
     MENU_COOLDOWN_S  = 10.0
     NUDGE_COOLDOWN_S = 20.0
     EMAIL_RP_COOLDOWN_S = 10.0
-    IDLE_MENU_DELAY_S = 7.0  # time of silence before menu
+    IDLE_MENU_DELAY_S = 7.0
     NUDGE_DELAY_AFTER_MENU_S = 10.0
 
     # voice/queue controls
     speak_task: asyncio.Task | None = None
-    speak_lock = asyncio.Lock()  # ensures one voice at a time
-    current_tts_label = ""       # for logs/barge-in grace
+    speak_lock = asyncio.Lock()
+    current_tts_label = ""
     barge_grace_until = 0.0
 
     # timers
@@ -481,18 +480,15 @@ async def handle_twilio(ws):
                 await asyncio.sleep(delay_s)
                 if stopped_flag or done_flag or state != STATE_IDLE: return
                 now = time.time()
-                # prefer menu if its cool-down passed; else, consider nudge
                 if now - last_prompt["menu"] >= MENU_COOLDOWN_S:
                     await speak(menu_text(), label="menu")
                     last_prompt["menu"] = time.time()
-                    # after menu, arm a nudge later (single timer re-armed)
                     restart_idle_timer(NUDGE_DELAY_AFTER_MENU_S)
                 elif now - last_prompt["nudge"] >= NUDGE_COOLDOWN_S:
                     await speak("You can say overview, pricing, pilot programs, hours, or how to get started.", label="nudge")
                     last_prompt["nudge"] = time.time()
-                    restart_idle_timer(NUDGE_COOLDOWN_S)  # continue nudging but spaced out
+                    restart_idle_timer(NUDGE_COOLDOWN_S)
                 else:
-                    # both on cooldown; try again a bit later
                     restart_idle_timer(3.0)
             except asyncio.CancelledError:
                 return
@@ -503,13 +499,11 @@ async def handle_twilio(ws):
         nonlocal speak_task, current_tts_label, barge_grace_until
         t = (text or "").strip()
         if not t or stopped_flag: return
-        # serialize voice
         async with speak_lock:
-            # kill any stray task (paranoia)
             cancel_task(speak_task)
             current_tts_label = label
             if label.startswith("answer:"):
-                barge_grace_until = time.time() + 0.9  # grace against accidental barge
+                barge_grace_until = time.time() + 0.9
             print(f"SAY ▶ {label}")
             try:
                 pre = 50 + int(random.uniform(-10, 15))
@@ -534,11 +528,34 @@ async def handle_twilio(ws):
                     if now - last_prompt["email_reprompt"] >= EMAIL_RP_COOLDOWN_S:
                         await speak("What’s the best email to reach you?", label="email_reprompt")
                         last_prompt["email_reprompt"] = time.time()
-                        start_email_timeout(seconds)  # keep gentle loop, spaced
+                        start_email_timeout(seconds)
             except asyncio.CancelledError:
                 return
         email_timeout_task = asyncio.create_task(_wait())
 
+    # ---- Guaranteed post-answer menu (single shot) ----
+    def schedule_menu_after_answer(delay_s: float = 1.2):
+        nonlocal idle_timer_task
+        cancel_task(idle_timer_task)
+        async def _later():
+            try:
+                await asyncio.sleep(delay_s)
+                if stopped_flag or done_flag: return
+                if state != STATE_IDLE:  # user speaking or email flow → skip
+                    return
+                now = time.time()
+                if now - last_prompt["menu"] < MENU_COOLDOWN_S:
+                    # respect cooldown; resume idle cadence for nudges
+                    restart_idle_timer(NUDGE_DELAY_AFTER_MENU_S)
+                    return
+                await speak(menu_text(), label="menu")
+                last_prompt["menu"] = time.time()
+                restart_idle_timer(NUDGE_DELAY_AFTER_MENU_S)
+            except asyncio.CancelledError:
+                return
+        asyncio.create_task(_later())
+
+    # ---- Flow helpers ----
     async def confirm_and_to_idle(captured_email: str):
         nonlocal state, awaiting_email, email_buffer
         awaiting_email = False
@@ -546,19 +563,15 @@ async def handle_twilio(ws):
         state = STATE_IDLE
         cancel_task(email_timeout_task)
         await speak(f"Got it. We’ll email you at {captured_email}.", label="email_confirm")
-        # after confirm, wait for user; arm single idle timer
+        schedule_menu_after_answer(1.0)  # brief confirm → one menu
         restart_idle_timer(IDLE_MENU_DELAY_S)
 
     # ---- User handling ----
     async def handle_user(text: str):
-        nonlocal state, awaiting_email, email_buffer, done_flag
+        nonlocal state, awaiting_email, email_buffer, done_flag, last_user_ts
         if done_flag or stopped_flag: return
 
-        # capture last activity
-        nonlocal last_user_ts
         last_user_ts = time.time()
-
-        # any user activity cancels idle timer and current TTS (except brief grace)
         cancel_task(idle_timer_task)
 
         # EMAIL FLOW
@@ -575,7 +588,6 @@ async def handle_twilio(ws):
                 await confirm_and_to_idle(m_curr.group(0)); return
             if spoken_buf:
                 await confirm_and_to_idle(spoken_buf); return
-            # LLM assist
             if OPENAI_ENABLE:
                 try:
                     r = await asyncio.wait_for(call_openai_nlu(email_buffer), timeout=OPENAI_TIMEOUT_S)
@@ -590,7 +602,6 @@ async def handle_twilio(ws):
                 state = STATE_ENDED
                 await speak(GOODBYE, label="goodbye")
                 return
-            # still waiting; a soft, COOL-DOWNed nudge will come from timer
             return
 
         # INTENT FLOW
@@ -623,6 +634,9 @@ async def handle_twilio(ws):
                 start_email_timeout(12.0)
             else:
                 state = STATE_IDLE
+                # guarantee one menu shortly after answer (if still idle)
+                schedule_menu_after_answer(1.2)
+                # backup idle timer in case cooldown blocks the menu
                 restart_idle_timer(IDLE_MENU_DELAY_S)
             return
 
@@ -630,6 +644,7 @@ async def handle_twilio(ws):
         state = STATE_ANSWERING
         await speak(RESPONSES["fallback"], label="fallback")
         state = STATE_IDLE
+        schedule_menu_after_answer(1.2)
         restart_idle_timer(IDLE_MENU_DELAY_S)
 
     # ---- Brain: ASR → handler with barge-in guard ----
@@ -646,18 +661,13 @@ async def handle_twilio(ws):
 
         async for item in deepgram_stream(pcm_iter):
             if stopped_flag: break
-            # VAD events cancel menus/nudges, but allow short grace on answers
             if isinstance(item, tuple) and item[0] == "__EVENT__":
                 ev = item[1]
                 if ev == "SpeechStarted":
-                    # cancel idle prompts
                     cancel_task(idle_timer_task)
-                    # hard barge-in only if within grace window for an answer
                     now = time.time()
                     if current_tts_label.startswith("answer:") and now < barge_grace_until:
-                        # ignore this short noise
                         continue
-                    # if speaking non-answer prompts, just let user take over; nothing else to do
                 continue
 
             utter, is_final = item
@@ -676,7 +686,6 @@ async def handle_twilio(ws):
                     await handle_user(pending_final)
                     pending_final = None
 
-        # flush tail
         if not stopped_flag and pending_final:
             await handle_user(pending_final)
 
@@ -692,8 +701,9 @@ async def handle_twilio(ws):
                 stream_sid = start_info.get("streamSid")
                 print(f"WS ▶ start streamSid={stream_sid}")
 
-                # Welcome + immediate idle timer (no stacked follow-ups)
+                # Welcome counts as a "menu" for cooldown purposes
                 await speak(WELCOME_MENU, label="welcome_menu")
+                last_prompt["menu"] = time.time()
                 restart_idle_timer(IDLE_MENU_DELAY_S)
 
             elif ev == "media":
