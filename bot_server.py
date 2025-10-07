@@ -29,7 +29,7 @@ except Exception:
     HTTP2_OK = False
 
 SHARED_CLIENT = httpx.AsyncClient(
-    timeout=httpx.Timeout(connect=5, read=60),
+    timeout=httpx.Timeout(60.0),  # total timeout (works across httpx versions)
     http2=HTTP2_OK,  # enable only if h2 is present
     limits=httpx.Limits(max_connections=20, max_keepalive_connections=10, keepalive_expiry=30),
     headers={"User-Agent": "NeuroMedAI-VoiceBot/1.0"}
@@ -37,7 +37,7 @@ SHARED_CLIENT = httpx.AsyncClient(
 
 # Resilient POST helper with retries/backoff
 async def _post_json(url: str, headers: dict, payload: dict, timeout_s: float | None = None):
-    timeout = httpx.Timeout(connect=5, read=(timeout_s or 30))
+    timeout = httpx.Timeout(timeout_s or 30.0)
     for attempt in range(5):
         try:
             r = await SHARED_CLIENT.post(url, headers=headers, json=payload, timeout=timeout)
@@ -135,13 +135,17 @@ SOUNDA_LIKE = {
     "ours":"hours","hour":"hours",
     "privacy":"privacy","private":"privacy","secure":"privacy",
 }
+
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9\s]", "", (s or "").lower()).strip()
+
 def _similar(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
+
 def _soft_map_token(tok: str) -> str:
     t = _norm(tok)
     return SOUNDA_LIKE.get(t, t)
+
 def _soft_match_intent(text: str) -> str | None:
     t = _norm(text)
     if not t: return None
@@ -166,6 +170,7 @@ def _soft_match_intent(text: str) -> str | None:
             return intent
     if "program" in tokens: return "pilot"
     return None
+
 def classify_intent_or_none(text: str) -> str:
     t = _strip_fillers(text or "")
     if not t: return "fallback"
@@ -181,14 +186,17 @@ def classify_intent_or_none(text: str) -> str:
 # ===== OpenAI micro NLU (parallel, tiny, cached) =====
 _openai_cache: dict[str, dict] = {}
 OPENAI_CACHE_MAX = 200
+
 def _cache_get(k: str):
     return _openai_cache.get(k)
+
 def _cache_set(k: str, v: dict):
     if len(_openai_cache) > OPENAI_CACHE_MAX:
         _openai_cache.clear()
     _openai_cache[k] = v
 
 INTENT_ENUM = ["overview","privacy","pricing","pilot","hours","start","none","fallback"]
+
 def _intent_system_prompt():
     return (
         "Return strict JSON with keys intent and email.\n"
@@ -237,8 +245,10 @@ async def call_openai_nlu(text: str) -> dict:
 # --------- helpers ---------
 def b64_to_bytes(s: str) -> bytes:
     return base64.b64decode(s)
+
 def bytes_to_b64(b: bytes) -> str:
     return base64.b64encode(b).decode()
+
 def _ulaw_silence(ms: int) -> bytes:
     return b"\xff" * int(8 * ms)  # 8kHz μ-law, 8 samples/ms
 
@@ -273,7 +283,7 @@ async def eleven_tts_stream(text: str):
         try:
             async with SHARED_CLIENT.stream(
                 "POST", url, headers=headers, json=payload,
-                timeout=httpx.Timeout(connect=5, read=60)
+                timeout=httpx.Timeout(60.0)
             ) as r:
                 if r.is_error:
                     body = await r.aread()
@@ -395,6 +405,7 @@ _NUMBER_WORDS = {
     "eighteen":"18","nineteen":"19","twenty":"20","thirty":"30","forty":"40","fifty":"50",
     "sixty":"60","seventy":"70","eighty":"80","ninety":"90",
 }
+
 def _word_numbers_to_digits(tokens):
     out = []
     for w in tokens:
@@ -402,6 +413,7 @@ def _word_numbers_to_digits(tokens):
         if lw in _NUMBER_WORDS: out.append(_NUMBER_WORDS[lw])
         else: out.append(w)
     return out
+
 _SP_OK = {"at":"@", "dot":".", "period":".", "underscore":"_", "dash":"-", "hyphen":"-", "plus":"+"}
 _EMAIL_FILLER = {
     "my","email","mail","address","is","it's","its","this","the","to","send","reach","me","at:",
@@ -418,8 +430,10 @@ _PROVIDER_FIXES = [
     (r"\bicloud\b", "icloud"),
     (r"\byahoo\b", "yahoo"),
 ]
+
 def _clean_tokens_for_email(toks):
     return [t for t in toks if t not in _EMAIL_FILLER]
+
 def normalize_spoken_email(text: str) -> str | None:
     if not text: return None
     t = re.sub(r"[^\w\s@.+-]", " ", text.lower())
@@ -627,7 +641,7 @@ async def handle_twilio(ws):
 
     # ---- User handling ----
     async def handle_user(text: str):
-        nonlocal state, awaiting_email, email_buffer, done_flag, last_user_ts
+        nonlocal state, awaiting_email, email_buffer, done_flag, last_user_ts, current_tts_label
         if done_flag or stopped_flag: return
 
         last_user_ts = time.time()
@@ -669,7 +683,7 @@ async def handle_twilio(ws):
                 return
             return
 
-        # ---- Intent flow (separate to keep handle_user concise) ----
+        # ---- Intent flow ----
         heuristic_intent = classify_intent_or_none(text)
         intent = heuristic_intent
         if OPENAI_ENABLE and heuristic_intent == "fallback":
