@@ -510,6 +510,7 @@ async def handle_twilio(ws):
     speak_lock = asyncio.Lock()
     current_tts_label = ""
     barge_grace_until = 0.0
+    menu_block_until = 0.0
 
     # timers
     first_media = asyncio.Event()
@@ -561,6 +562,10 @@ async def handle_twilio(ws):
                 if menu_inflight:
                     restart_idle_timer(3.0)
                     return
+                # Respect blocking window after menu scheduling/speaking
+                if time.time() < menu_block_until:
+                    restart_idle_timer(3.0)
+                    return
                 now = time.time()
                 if now - last_prompt["menu"] >= MENU_COOLDOWN_S:
                     await speak(menu_text(), label="menu")
@@ -588,6 +593,8 @@ async def handle_twilio(ws):
                 if (now - last_prompt["menu"]) < MENU_DEBOUNCE_S or menu_inflight:
                     return
                 menu_inflight = True
+                # extend block window while this menu is being spoken
+                menu_block_until = max(menu_block_until, time.time() + 1.0)
             cancel_task(speak_task)
             current_tts_label = label
             if label.startswith("answer:"):
@@ -640,6 +647,10 @@ async def handle_twilio(ws):
                     return
                 # If a menu is currently in-flight, skip scheduling another
                 if menu_inflight:
+                    restart_idle_timer(NUDGE_DELAY_AFTER_MENU_S)
+                    return
+                # Respect blocking window to avoid race with idle timer
+                if time.time() < menu_block_until:
                     restart_idle_timer(NUDGE_DELAY_AFTER_MENU_S)
                     return
                 await speak(menu_text(), label="menu")
