@@ -644,6 +644,7 @@ async def handle_twilio(ws):
                     return
                 await speak(menu_text(), label="menu")
                 last_prompt["menu"] = time.time()
+                # Restart idle timer after menu is spoken
                 restart_idle_timer(NUDGE_DELAY_AFTER_MENU_S)
             except asyncio.CancelledError:
                 return
@@ -656,9 +657,8 @@ async def handle_twilio(ws):
         email_buffer = ""
         state = STATE_IDLE
         cancel_task(email_timeout_task)
-        await speak(f"Got it. We’ll email you at {captured_email}.", label="email_confirm")
+        await speak(f"Got it. We'll email you at {captured_email}.", label="email_confirm")
         schedule_menu_after_answer(1.0)
-        restart_idle_timer(IDLE_MENU_DELAY_S)
 
     # ---- User handling ----
     async def handle_user(text: str):
@@ -735,7 +735,6 @@ async def handle_twilio(ws):
             else:
                 state = STATE_IDLE
                 schedule_menu_after_answer(1.2)
-                restart_idle_timer(IDLE_MENU_DELAY_S)
             return
 
         # fallback → one line, then go idle
@@ -743,7 +742,6 @@ async def handle_twilio(ws):
         await speak(RESPONSES["fallback"], label="fallback")
         state = STATE_IDLE
         schedule_menu_after_answer(1.2)
-        restart_idle_timer(IDLE_MENU_DELAY_S)
 
     # ---- Brain: ASR → handler with barge-in & welcome-echo guard ----
     async def brain():
