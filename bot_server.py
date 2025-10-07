@@ -13,12 +13,44 @@ HTTP_ORIGIN    = os.getenv("PUBLIC_HTTP_ORIGIN", "http://localhost:8000")
 PORT           = int(os.getenv("PORT", "8080"))
 
 ECHO_BACK      = os.getenv("ECHO_BACK", "0") == "1"
-ELEVEN_VOICE   = os.getenv("ELEVENLABS_VOICE_ID", "Bella")
+ELEVEN_VOICE   = os.getenv("ELEVENLABS_VOICE_ID", "Bella")  # Prefer a real VOICE ID here
 
 # OpenAI model + timeouts (fast + cheap)
 OPENAI_MODEL         = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT_S     = float(os.getenv("OPENAI_TIMEOUT_S", "0.6"))
 OPENAI_ENABLE        = bool(OPENAI_API_KEY)
+
+# --------- Shared HTTP client (safe HTTP/2) ---------
+HTTP2_OK = False
+try:
+    import h2  # noqa: F401
+    HTTP2_OK = True
+except Exception:
+    HTTP2_OK = False
+
+SHARED_CLIENT = httpx.AsyncClient(
+    timeout=httpx.Timeout(connect=5, read=60),
+    http2=HTTP2_OK,  # enable only if h2 is present
+    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10, keepalive_expiry=30),
+    headers={"User-Agent": "NeuroMedAI-VoiceBot/1.0"}
+)
+
+# Resilient POST helper with retries/backoff
+async def _post_json(url: str, headers: dict, payload: dict, timeout_s: float | None = None):
+    timeout = httpx.Timeout(connect=5, read=(timeout_s or 30))
+    for attempt in range(5):
+        try:
+            r = await SHARED_CLIENT.post(url, headers=headers, json=payload, timeout=timeout)
+            if r.status_code in (408, 409, 429, 500, 502, 503, 504):
+                await asyncio.sleep(min(2 ** attempt + random.random(), 10))
+                continue
+            r.raise_for_status()
+            return r
+        except (httpx.HTTPStatusError, httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError) as e:
+            if attempt >= 4:
+                print("HTTP POST FAIL ▶", url, repr(e))
+                raise
+            await asyncio.sleep(min(2 ** attempt + random.random(), 8))
 
 # --------- Menu content ---------
 def menu_text():
@@ -165,6 +197,7 @@ def _intent_system_prompt():
         "→ julia16@gmail.com), else null. Do not include extra keys.\n"
         "Consider homophones and ASR noise. Keep it fast. No prose."
     )
+
 async def call_openai_nlu(text: str) -> dict:
     if not OPENAI_ENABLE or not text.strip():
         return {}
@@ -172,11 +205,9 @@ async def call_openai_nlu(text: str) -> dict:
     cached = _cache_get(key)
     if cached:
         return cached
+
     url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": OPENAI_MODEL,
         "temperature": 0.1,
@@ -188,23 +219,17 @@ async def call_openai_nlu(text: str) -> dict:
         ],
     }
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(OPENAI_TIMEOUT_S)) as client:
-            resp = await client.post(url, headers=headers, json=payload)
-            if resp.status_code != 200:
-                print("OPENAI ERR ▶", resp.status_code, resp.text[:200])
-                return {}
-            data = resp.json()
-            content = (data.get("choices", [{}])[0]
-                           .get("message", {})
-                           .get("content", "")).strip()
-            obj = json.loads(content or "{}")
-            intent = obj.get("intent")
-            email  = obj.get("email")
-            if intent not in INTENT_ENUM:
-                intent = "fallback"
-            out = {"intent": intent, "email": email if isinstance(email, str) and email else None, "confidence": 0.75}
-            _cache_set(key, out)
-            return out
+        r = await _post_json(url, headers, payload, timeout_s=OPENAI_TIMEOUT_S or 1.0)
+        data = r.json()
+        content = (data.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
+        obj = json.loads(content or "{}")
+        intent = obj.get("intent")
+        email  = obj.get("email")
+        if intent not in INTENT_ENUM:
+            intent = "fallback"
+        out = {"intent": intent, "email": email if isinstance(email, str) and email else None, "confidence": 0.75}
+        _cache_set(key, out)
+        return out
     except Exception as e:
         print("OPENAI EXC ▶", repr(e))
         return {}
@@ -225,7 +250,7 @@ async def send_silence(ws_send_pcm, ms: int):
     except (websockets.exceptions.ConnectionClosedOK, websockets.exceptions.ConnectionClosedError):
         pass
 
-# --------- ElevenLabs TTS (ulaw_8000) with simple cache ---------
+# --------- ElevenLabs TTS (ulaw_8000) with session-level retries + simple cache ---------
 @lru_cache(maxsize=256)
 def _tts_key(text: str) -> str:
     return (text or "").strip().lower()
@@ -238,15 +263,35 @@ async def eleven_tts_stream(text: str):
         "?optimize_streaming_latency=3&output_format=ulaw_8000"
     )
     headers = { "xi-api-key": ELEVEN_KEY, "Content-Type": "application/json", "Accept": "*/*" }
-    payload = {"text": text, "model_id": "eleven_multilingual_v2",
-               "voice_settings": {"stability": 0.5, "similarity_boost": 0.8}}
-    async with httpx.AsyncClient(timeout=None) as client:
-        async with client.stream("POST", url, headers=headers, json=payload) as r:
-            if r.is_error:
-                body = await r.aread()
-                print("ELEVENLABS HTTP ERROR ▶", r.status_code, body[:200]); return
-            async for chunk in r.aiter_bytes():
-                if chunk: yield chunk
+    payload = {
+        "text": text,
+        "model_id": "eleven_multilingual_v2",
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.8}
+    }
+
+    for attempt in range(4):
+        try:
+            async with SHARED_CLIENT.stream(
+                "POST", url, headers=headers, json=payload,
+                timeout=httpx.Timeout(connect=5, read=60)
+            ) as r:
+                if r.is_error:
+                    body = await r.aread()
+                    print("ELEVENLABS HTTP ERROR ▶", r.status_code, body[:200])
+                    if attempt >= 3:
+                        return
+                    await asyncio.sleep(min(2 ** attempt + random.random(), 6))
+                    continue
+
+                async for chunk in r.aiter_bytes():
+                    if chunk:
+                        yield chunk
+                return
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError) as e:
+            print("ELEVENLABS EXC ▶", repr(e))
+            if attempt >= 3:
+                return
+            await asyncio.sleep(min(2 ** attempt + random.random(), 6))
 
 async def eleven_tts_stream_cached(text: str):
     key = _tts_key(text)
@@ -298,7 +343,8 @@ async def deepgram_stream(pcm_iter):
             try:
                 async for chunk in pcm_iter():
                     if chunk is None: break
-                    try: await dg.send(chunk)
+                    try:
+                        await dg.send(chunk)
                     except (websockets.exceptions.ConnectionClosedOK,
                             websockets.exceptions.ConnectionClosedError):
                         break
@@ -386,6 +432,10 @@ def normalize_spoken_email(text: str) -> str | None:
     s = " ".join(toks)
     s = re.sub(r"\s*@\s*", "@", s)
     s = re.sub(r"\s*\.\s*", ".", s)
+    # extra normalizers for hyphenated dictation / stray spaces
+    s = s.replace("-dot-", ".").replace("-@", "@").replace(".@", "@").replace("@.", "@")
+    s = re.sub(r"(@|\.)\s+", r"\1", s)
+
     if "@" in s:
         local, _, domain = s.partition("@")
         local = re.sub(r"\s+", "", local)
@@ -487,7 +537,8 @@ async def handle_twilio(ws):
         async def _idle():
             try:
                 await asyncio.sleep(delay_s)
-                if stopped_flag or done_flag or state != STATE_IDLE: return
+                if stopped_flag or done_flag or state != STATE_IDLE: 
+                    return
                 now = time.time()
                 if now - last_prompt["menu"] >= MENU_COOLDOWN_S:
                     await speak(menu_text(), label="menu")
@@ -618,7 +669,7 @@ async def handle_twilio(ws):
                 return
             return
 
-    # ---- Intent flow (separate to keep handle_user concise) ----
+        # ---- Intent flow (separate to keep handle_user concise) ----
         heuristic_intent = classify_intent_or_none(text)
         intent = heuristic_intent
         if OPENAI_ENABLE and heuristic_intent == "fallback":
@@ -673,13 +724,20 @@ async def handle_twilio(ws):
 
         async for item in deepgram_stream(pcm_iter):
             if stopped_flag: break
+            # Handle ASR events
             if isinstance(item, tuple) and item[0] == "__EVENT__":
                 ev = item[1]
                 if ev == "SpeechStarted":
+                    # Stop idle menu
                     cancel_task(idle_timer_task)
                     now = time.time()
-                    if current_tts_label.startswith("answer:") and now < barge_grace_until:
+                    # if within grace after we started speaking, ignore
+                    if now < barge_grace_until:
                         continue
+                    # caller is talking → barge-in: cancel any ongoing TTS
+                    cancel_task(speak_task)
+                    nonlocal current_tts_label
+                    current_tts_label = ""
                 continue
 
             utter, is_final = item
@@ -699,11 +757,16 @@ async def handle_twilio(ws):
                     words = pending_final.split()
                     normalized = pending_final.lower().strip()
 
-                    # 3a) ignore likely echoes during welcome guard
+                    # ignore likely echoes during welcome guard
                     if time.time() < welcome_guard_until:
                         if any(normalized.startswith(p) for p in STOPLIST_PHRASES):
                             pending_final = None
                             continue
+
+                    # if it's just a single keyword matching our own menu (likely echo), skip
+                    if len(normalized.split()) <= 2 and normalized in MENU_KEYWORDS:
+                        pending_final = None
+                        continue
 
                     has_punct = bool(re.search(r"[.!?…]\s*$", pending_final))
                     has_menu_kw = any(kw in normalized for kw in MENU_KEYWORDS)
@@ -742,6 +805,10 @@ async def handle_twilio(ws):
                 if not first_media.is_set():
                     first_media.set()
                     print("WS ▶ first media frame")
+                # backpressure: drop oldest if queue too large
+                if inbound_q.qsize() > 50:
+                    try: inbound_q.get_nowait()
+                    except Exception: pass
                 await inbound_q.put(buf)
                 if ECHO_BACK and stream_sid and conn_open:
                     await send_pcm(buf)
@@ -774,6 +841,7 @@ async def main():
     print("ENV ▶ ELEVEN_VOICE=", ELEVEN_VOICE)
     print("ENV ▶ OPENAI      =", "yes" if OPENAI_ENABLE else "disabled")
     print("ENV ▶ PORT        =", PORT)
+    print("ENV ▶ HTTP2_OK    =", HTTP2_OK)
 
     async with websockets.serve(
         handle_twilio, "0.0.0.0", PORT,
@@ -784,4 +852,13 @@ async def main():
         await asyncio.Future()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        # Best-effort graceful close for shared client (loop is closed after asyncio.run)
+        try:
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(SHARED_CLIENT.aclose())
+            loop.close()
+        except Exception:
+            pass
