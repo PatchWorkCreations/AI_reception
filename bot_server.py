@@ -65,6 +65,7 @@ DOMAIN_SPOKEN = "Neuro Med A I dot org"
 WELCOME = "Hey there! Welcome to NeuroMed AI — your kind and clever health assistant. "
 WELCOME_MENU = WELCOME + menu_text()
 GOODBYE = f"Thank you! Don’t forget to visit {DOMAIN_SPOKEN}."
+HINT_SAY_MENU = "If there's anything else I can help you with, say 'menu'."
 
 RESPONSES = {
     "overview": (
@@ -550,7 +551,7 @@ async def handle_twilio(ws):
         if t and not t.done():
             t.cancel()
 
-    # ---- Idle menu/nudge (single timer) ----
+    # ---- Idle nudge (single timer; no auto menu) ----
     def restart_idle_timer(delay_s: float):
         nonlocal idle_timer_task, menu_block_until
         cancel_task(idle_timer_task)
@@ -568,10 +569,8 @@ async def handle_twilio(ws):
                     restart_idle_timer(3.0)
                     return
                 now = time.time()
-                if now - last_prompt["menu"] >= MENU_COOLDOWN_S:
-                    schedule_menu(0.0)
-                    return
-                elif now - last_prompt["nudge"] >= NUDGE_COOLDOWN_S:
+                # Do not auto-play the menu; gently nudge instead
+                if now - last_prompt["nudge"] >= NUDGE_COOLDOWN_S:
                     await speak("You can say overview, pricing, pilot programs, hours, or how to get started.", label="nudge")
                     last_prompt["nudge"] = time.time()
                     restart_idle_timer(NUDGE_COOLDOWN_S)
@@ -662,7 +661,8 @@ async def handle_twilio(ws):
 
     # ---- Guaranteed post-answer menu (single shot) ----
     def schedule_menu_after_answer(delay_s: float = 1.2):
-        schedule_menu(delay_s)
+        # Disable auto menu after answer; just restart idle flow
+        restart_idle_timer(IDLE_MENU_DELAY_S)
 
     # ---- Flow helpers ----
     async def confirm_and_to_idle(captured_email: str):
@@ -710,6 +710,10 @@ async def handle_twilio(ws):
                         await confirm_and_to_idle(em); return
                 except asyncio.TimeoutError:
                     pass
+            if classify_intent_or_none(text) == "menu":
+                state = STATE_IDLE
+                schedule_menu(0.0)
+                return
             if classify_intent_or_none(text) == "none":
                 done_flag = True
                 cancel_task(email_timeout_task)
@@ -739,6 +743,12 @@ async def handle_twilio(ws):
             await speak(GOODBYE, label="goodbye")
             return
 
+        # Explicit menu request overrides any other flow
+        if classify_intent_or_none(text) == "menu":
+            state = STATE_IDLE
+            schedule_menu(0.0)
+            return
+
         if intent in RESPONSES and intent != "fallback":
             state = STATE_ANSWERING
             await speak(RESPONSES[intent], label=f"answer:{intent}")
@@ -748,14 +758,15 @@ async def handle_twilio(ws):
                 start_email_timeout(12.0)
             else:
                 state = STATE_IDLE
-                schedule_menu_after_answer(1.2)
+                # Give a short hint instead of auto menu
+                await speak(HINT_SAY_MENU, label="hint")
             return
 
         # fallback → one line, then go idle
         state = STATE_ANSWERING
         await speak(RESPONSES["fallback"], label="fallback")
         state = STATE_IDLE
-        schedule_menu_after_answer(1.2)
+        await speak(HINT_SAY_MENU, label="hint")
 
     # ---- Brain: ASR → handler with barge-in & welcome-echo guard ----
     async def brain():
