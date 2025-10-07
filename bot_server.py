@@ -577,11 +577,11 @@ async def handle_twilio(ws):
 
     # ---- Speaking (serialized; no overlap) ----
     async def speak(text: str, label: str = "tts"):
-        nonlocal speak_task, current_tts_label, barge_grace_until
+        nonlocal speak_task, current_tts_label, barge_grace_until, menu_inflight
         t = (text or "").strip()
         if not t or stopped_flag: return
         async with speak_lock:
-            # Debounce duplicate menus
+            # Debounce duplicate menus right here so racing callers can't double-play.
             if label == "menu":
                 now = time.time()
                 if (now - last_prompt["menu"]) < MENU_DEBOUNCE_S or menu_inflight:
@@ -602,6 +602,9 @@ async def handle_twilio(ws):
                 await send_silence(send_pcm, max(post, 20))
             finally:
                 current_tts_label = ""
+                if label == "menu":
+                    last_prompt["menu"] = time.time()
+                    menu_inflight = False
 
     # ---- Email reprompt timer (spaced) ----
     def start_email_timeout(seconds: float = 12.0):
