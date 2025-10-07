@@ -551,7 +551,7 @@ async def handle_twilio(ws):
 
     # ---- Idle menu/nudge (single timer) ----
     def restart_idle_timer(delay_s: float):
-        nonlocal idle_timer_task
+        nonlocal idle_timer_task, menu_block_until
         cancel_task(idle_timer_task)
         async def _idle():
             try:
@@ -583,7 +583,7 @@ async def handle_twilio(ws):
 
     # ---- Speaking (serialized; no overlap) ----
     async def speak(text: str, label: str = "tts"):
-        nonlocal speak_task, current_tts_label, barge_grace_until, menu_inflight
+        nonlocal speak_task, current_tts_label, barge_grace_until, menu_inflight, menu_block_until
         t = (text or "").strip()
         if not t or stopped_flag: return
         async with speak_lock:
@@ -633,7 +633,7 @@ async def handle_twilio(ws):
 
     # ---- Guaranteed post-answer menu (single shot) ----
     def schedule_menu_after_answer(delay_s: float = 1.2):
-        nonlocal idle_timer_task
+        nonlocal idle_timer_task, menu_block_until
         cancel_task(idle_timer_task)
         async def _later():
             try:
