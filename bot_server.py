@@ -557,6 +557,10 @@ async def handle_twilio(ws):
                 await asyncio.sleep(delay_s)
                 if stopped_flag or done_flag or state != STATE_IDLE: 
                     return
+                # If a menu is currently in-flight, do not trigger another
+                if menu_inflight:
+                    restart_idle_timer(3.0)
+                    return
                 now = time.time()
                 if now - last_prompt["menu"] >= MENU_COOLDOWN_S:
                     await speak(menu_text(), label="menu")
@@ -632,6 +636,10 @@ async def handle_twilio(ws):
                     return
                 now = time.time()
                 if now - last_prompt["menu"] < MENU_COOLDOWN_S:
+                    restart_idle_timer(NUDGE_DELAY_AFTER_MENU_S)
+                    return
+                # If a menu is currently in-flight, skip scheduling another
+                if menu_inflight:
                     restart_idle_timer(NUDGE_DELAY_AFTER_MENU_S)
                     return
                 await speak(menu_text(), label="menu")
