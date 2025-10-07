@@ -511,6 +511,7 @@ async def handle_twilio(ws):
     current_tts_label = ""
     barge_grace_until = 0.0
     menu_block_until = 0.0
+    menu_scheduled_task: asyncio.Task | None = None
 
     # timers
     first_media = asyncio.Event()
@@ -568,9 +569,8 @@ async def handle_twilio(ws):
                     return
                 now = time.time()
                 if now - last_prompt["menu"] >= MENU_COOLDOWN_S:
-                    await speak(menu_text(), label="menu")
-                    last_prompt["menu"] = time.time()
-                    restart_idle_timer(NUDGE_DELAY_AFTER_MENU_S)
+                    schedule_menu(0.0)
+                    return
                 elif now - last_prompt["nudge"] >= NUDGE_COOLDOWN_S:
                     await speak("You can say overview, pricing, pilot programs, hours, or how to get started.", label="nudge")
                     last_prompt["nudge"] = time.time()
@@ -580,6 +580,35 @@ async def handle_twilio(ws):
             except asyncio.CancelledError:
                 return
         idle_timer_task = asyncio.create_task(_idle())
+
+    # ---- Unified menu scheduler (cancels previous, debounced) ----
+    def schedule_menu(delay_s: float):
+        nonlocal menu_scheduled_task, idle_timer_task, menu_block_until
+        # cancel any previously scheduled menu
+        cancel_task(menu_scheduled_task)
+        # set a block window so idle timer doesn't race
+        menu_block_until = max(menu_block_until, time.time() + delay_s + 0.8)
+        # stop idle timer while we prepare to speak a menu
+        cancel_task(idle_timer_task)
+        async def _later():
+            try:
+                await asyncio.sleep(delay_s)
+                if stopped_flag or done_flag: return
+                if state != STATE_IDLE: return
+                # avoid races: if we've recently done a menu or one is in-flight, skip
+                now = time.time()
+                if (now - last_prompt["menu"]) < MENU_COOLDOWN_S: 
+                    restart_idle_timer(NUDGE_DELAY_AFTER_MENU_S)
+                    return
+                if menu_inflight or (time.time() < menu_block_until):
+                    restart_idle_timer(NUDGE_DELAY_AFTER_MENU_S)
+                    return
+                await speak(menu_text(), label="menu")
+                last_prompt["menu"] = time.time()
+                restart_idle_timer(NUDGE_DELAY_AFTER_MENU_S)
+            except asyncio.CancelledError:
+                return
+        menu_scheduled_task = asyncio.create_task(_later())
 
     # ---- Speaking (serialized; no overlap) ----
     async def speak(text: str, label: str = "tts"):
@@ -633,33 +662,7 @@ async def handle_twilio(ws):
 
     # ---- Guaranteed post-answer menu (single shot) ----
     def schedule_menu_after_answer(delay_s: float = 1.2):
-        nonlocal idle_timer_task, menu_block_until
-        cancel_task(idle_timer_task)
-        async def _later():
-            try:
-                await asyncio.sleep(delay_s)
-                if stopped_flag or done_flag: return
-                if state != STATE_IDLE:  # user speaking or email flow → skip
-                    return
-                now = time.time()
-                if now - last_prompt["menu"] < MENU_COOLDOWN_S:
-                    restart_idle_timer(NUDGE_DELAY_AFTER_MENU_S)
-                    return
-                # If a menu is currently in-flight, skip scheduling another
-                if menu_inflight:
-                    restart_idle_timer(NUDGE_DELAY_AFTER_MENU_S)
-                    return
-                # Respect blocking window to avoid race with idle timer
-                if time.time() < menu_block_until:
-                    restart_idle_timer(NUDGE_DELAY_AFTER_MENU_S)
-                    return
-                await speak(menu_text(), label="menu")
-                last_prompt["menu"] = time.time()
-                # Restart idle timer after menu is spoken
-                restart_idle_timer(NUDGE_DELAY_AFTER_MENU_S)
-            except asyncio.CancelledError:
-                return
-        asyncio.create_task(_later())
+        schedule_menu(delay_s)
 
     # ---- Flow helpers ----
     async def confirm_and_to_idle(captured_email: str):
