@@ -493,6 +493,10 @@ async def handle_twilio(ws):
     IDLE_MENU_DELAY_S = 7.0
     NUDGE_DELAY_AFTER_MENU_S = 10.0
 
+    # Debounce menu so it doesn’t speak twice back-to-back
+    MENU_DEBOUNCE_S = 2.0
+    menu_inflight = False
+
     # guards (welcome echo)
     WELCOME_GUARD_S = 3.0  # ignore obvious echoes for this long after welcome
     welcome_guard_until = 0.0
@@ -505,6 +509,9 @@ async def handle_twilio(ws):
     speak_task: asyncio.Task | None = None
     speak_lock = asyncio.Lock()
     current_tts_label = ""
+                if label == "menu":
+                    last_prompt["menu"] = time.time()
+                    menu_inflight = False
     barge_grace_until = 0.0
 
     # timers
@@ -574,6 +581,12 @@ async def handle_twilio(ws):
         t = (text or "").strip()
         if not t or stopped_flag: return
         async with speak_lock:
+            # Debounce duplicate menus
+            if label == "menu":
+                now = time.time()
+                if (now - last_prompt["menu"]) < MENU_DEBOUNCE_S or menu_inflight:
+                    return
+                menu_inflight = True
             cancel_task(speak_task)
             current_tts_label = label
             if label.startswith("answer:"):
