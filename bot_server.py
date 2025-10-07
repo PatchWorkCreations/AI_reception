@@ -509,9 +509,6 @@ async def handle_twilio(ws):
     speak_task: asyncio.Task | None = None
     speak_lock = asyncio.Lock()
     current_tts_label = ""
-                if label == "menu":
-                    last_prompt["menu"] = time.time()
-                    menu_inflight = False
     barge_grace_until = 0.0
 
     # timers
