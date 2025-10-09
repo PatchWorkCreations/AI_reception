@@ -1,6 +1,6 @@
 # myApp/urls.py
 from django.urls import path
-from .views import voice_answer, status_cb, call_me, ws_url_debug
+from .views import voice_answer, status_cb, call_me, ws_url_debug, voice_ai_speaking
 from . import views
 
 app_name = "twilio"
@@ -15,6 +15,6 @@ urlpatterns = [
     path("debug/ws-url",  ws_url_debug, name="ws_url_debug"),
     path("debug/ws-url/", ws_url_debug),
 
-
     path('dev/', views.dev_client, name='dev_client'),
+    path('voice-ai/', voice_ai_speaking, name='voice_ai_speaking'),
 ]

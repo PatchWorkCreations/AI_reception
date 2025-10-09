@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>NeuroMed AI – Voice Receptionist</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { 
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif; 
+      margin: 0; 
+      background: linear-gradient(135deg, #0f1419 0%, #1a2332 100%);
+      color: #e6eefc; 
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      overflow: hidden;
+    }
+    .wrap { 
+      max-width: 440px; 
+      width: 100%;
+      padding: 24px; 
+    }
+    .call-card { 
+      background: linear-gradient(145deg, #1a2635 0%, #141d2e 100%);
+      border-radius: 32px; 
+      padding: 48px 32px 32px; 
+      box-shadow: 0 20px 60px rgba(0,0,0,.5), 0 0 0 1px rgba(255,255,255,.05);
+      text-align: center;
+    }
+    .status-badge { 
+      display: inline-block;
+      background: rgba(255,255,255,.08);
+      padding: 8px 18px; 
+      border-radius: 20px; 
+      font-size: 13px; 
+      font-weight: 500;
+      color: #8b9cb8; 
+      margin-bottom: 24px;
+      letter-spacing: 0.3px;
+      text-transform: uppercase;
+    }
+    .status-badge.active { 
+      background: linear-gradient(135deg, #0ea96d 0%, #0c8553 100%);
+      color: white;
+      box-shadow: 0 4px 16px rgba(14,169,109,.3);
+    }
+    .avatar-container {
+      position: relative;
+      width: 180px;
+      height: 180px;
+      margin: 0 auto 32px;
+    }
+    .avatar {
+      width: 140px;
+      height: 140px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #2a7fff 0%, #1b5fd1 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 56px;
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      box-shadow: 0 8px 32px rgba(42,127,255,.3);
+      z-index: 2;
+    }
+    .voice-ring {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 140px;
+      height: 140px;
+      border-radius: 50%;
+      border: 3px solid rgba(42,127,255,.4);
+      opacity: 0;
+      z-index: 1;
+    }
+    .voice-ring.speaking {
+      animation: pulse-ring 1.8s ease-out infinite;
+    }
+    .voice-ring#ring2.speaking {
+      animation-delay: 0.6s;
+    }
+    @keyframes pulse-ring {
+      0% { transform: translate(-50%, -50%) scale(1); opacity: 0.6; }
+      100% { transform: translate(-50%, -50%) scale(1.4); opacity: 0; }
+    }
+    .caller-name {
+      font-size: 28px;
+      font-weight: 600;
+      margin: 0 0 8px;
+      color: #ffffff;
+    }
+    .caller-title {
+      font-size: 15px;
+      color: #7a8ca5;
+      margin: 0 0 32px;
+    }
+    .transcript-box {
+      background: rgba(255,255,255,.04);
+      border-radius: 16px;
+      padding: 20px;
+      min-height: 80px;
+      max-height: 160px;
+      overflow-y: auto;
+      margin-bottom: 32px;
+      border: 1px solid rgba(255,255,255,.06);
+    }
+    .transcript-line {
+      margin: 8px 0;
+      font-size: 14px;
+      line-height: 1.6;
+      text-align: left;
+    }
+    .transcript-line.you { color: #a8d0ff; }
+    .transcript-line.bot { color: #8fdb9f; }
+    .transcript-line.partial { color: #6b7a91; font-style: italic; }
+    .transcript-line.error { 
+      color: #ff6b6b; 
+      font-weight: 500; 
+      background: rgba(255,107,107,.1);
+      padding: 8px 12px;
+      border-radius: 8px;
+      border-left: 3px solid #ff6b6b;
+    }
+    .controls {
+      display: flex;
+      gap: 20px;
+      justify-content: center;
+      align-items: center;
+    }
+    .call-btn {
+      width: 64px;
+      height: 64px;
+      border-radius: 50%;
+      border: 0;
+      cursor: pointer;
+      font-size: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s ease;
+      box-shadow: 0 4px 16px rgba(0,0,0,.2);
+    }
+    .call-btn:active {
+      transform: scale(0.95);
+    }
+    .call-btn[disabled] {
+      opacity: 0.3;
+      cursor: not-allowed;
+    }
+    .call-btn.start {
+      background: linear-gradient(135deg, #0ea96d 0%, #0c8553 100%);
+      width: 72px;
+      height: 72px;
+      box-shadow: 0 6px 24px rgba(14,169,109,.4);
+    }
+    .call-btn.end {
+      background: linear-gradient(135deg, #e53e3e 0%, #c53030 100%);
+      box-shadow: 0 6px 24px rgba(229,62,62,.4);
+    }
+    .call-btn.test {
+      background: rgba(255,255,255,.1);
+      backdrop-filter: blur(10px);
+    }
+    .call-btn:hover:not([disabled]) {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 24px rgba(0,0,0,.3);
+    }
+    audio { display: none; }
+    
+    /* Scrollbar styling */
+    .transcript-box::-webkit-scrollbar {
+      width: 6px;
+    }
+    .transcript-box::-webkit-scrollbar-track {
+      background: rgba(255,255,255,.02);
+      border-radius: 3px;
+    }
+    .transcript-box::-webkit-scrollbar-thumb {
+      background: rgba(255,255,255,.1);
+      border-radius: 3px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="call-card">
+      <div class="status-badge" id="status">Ready to Connect</div>
+      
+      <div class="avatar-container">
+        <div class="avatar">🏥</div>
+        <div class="voice-ring" id="ring1"></div>
+        <div class="voice-ring" id="ring2"></div>
+      </div>
+      
+      <h1 class="caller-name">NeuroMed AI</h1>
+      <p class="caller-title">Virtual Receptionist</p>
+      
+      <div class="transcript-box" id="transcript">
+        <div class="transcript-line partial">Click the green button to start your call...</div>
+      </div>
+      
+      <div class="controls">
+        <button id="testBtn" class="call-btn test" disabled title="Test Voice">🔊</button>
+        <button id="startBtn" class="call-btn start">📞</button>
+        <button id="stopBtn" class="call-btn end" disabled>📵</button>
+      </div>
+    </div>
+  </div>
+  
+  <audio id="audio" autoplay playsinline></audio>
+
+<script>
+  const transcriptEl = document.getElementById('transcript');
+  const statusEl = document.getElementById('status');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn  = document.getElementById('stopBtn');
+  const testBtn  = document.getElementById('testBtn');
+  const audioEl  = document.getElementById('audio');
+  const ring1 = document.getElementById('ring1');
+  const ring2 = document.getElementById('ring2');
+
+  let ws;
+  let mediaRecorder;
+  let audioQueue = [];  // Array of ArrayBuffers (mp3 chunks)
+  let playing = false;
+  let isSpeaking = false;
+
+  function addTranscript(text, type = 'partial') {
+    const line = document.createElement('div');
+    line.className = `transcript-line ${type}`;
+    
+    // Handle multiline messages (preserve line breaks)
+    if (text.includes('\n')) {
+      line.style.whiteSpace = 'pre-line';
+    }
+    
+    line.textContent = text;
+    transcriptEl.appendChild(line);
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    
+    // Keep only last 8 messages
+    while (transcriptEl.children.length > 8) {
+      transcriptEl.removeChild(transcriptEl.firstChild);
+    }
+  }
+
+  function setStatus(text, active = false) {
+    statusEl.textContent = text;
+    if (active) {
+      statusEl.classList.add('active');
+    } else {
+      statusEl.classList.remove('active');
+    }
+  }
+
+  function startVoiceAnimation() {
+    ring1.classList.add('speaking');
+    ring2.classList.add('speaking');
+    isSpeaking = true;
+  }
+
+  function stopVoiceAnimation() {
+    ring1.classList.remove('speaking');
+    ring2.classList.remove('speaking');
+    isSpeaking = false;
+  }
+
+  function wsUrl() {
+    const loc = window.location;
+    const scheme = loc.protocol === "https:" ? "wss" : "ws";
+    return `${scheme}://${loc.host}/ws/voice-ai/`;
+  }
+
+  async function start() {
+    // Clear previous transcript
+    transcriptEl.innerHTML = '';
+    
+    // connect WS
+    ws = new WebSocket(wsUrl());
+    ws.binaryType = "arraybuffer";
+    
+    // Set audio properties for autoplay after user gesture
+    audioEl.autoplay = true;
+    audioEl.muted = false;
+    audioEl.setAttribute('playsinline', '');
+
+    setStatus('Connecting...', false);
+    addTranscript('Dialing...', 'partial');
+
+    ws.onopen = () => {
+      setStatus('Call Connected', true);
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      testBtn.disabled = false;
+      startMic(); // user gesture already happened (Start click), so playback is allowed
+    };
+
+    ws.onmessage = (evt) => {
+      if (typeof evt.data === 'string') {
+        try {
+          const msg = JSON.parse(evt.data);
+          if (msg.type === 'ready') {
+            addTranscript('Connected. Listening...', 'partial');
+          }
+          if (msg.type === 'partial') {
+            // Replace last partial if exists
+            const lastLine = transcriptEl.lastElementChild;
+            if (lastLine && lastLine.classList.contains('partial')) {
+              lastLine.textContent = msg.text + '...';
+            } else {
+              addTranscript(msg.text + '...', 'partial');
+            }
+          }
+          if (msg.type === 'transcript') {
+            addTranscript('You: ' + msg.text, 'you');
+          }
+          if (msg.type === 'assistant_text') {
+            addTranscript('Receptionist: ' + msg.text, 'bot');
+            startVoiceAnimation();
+          }
+          if (msg.type === 'error') {
+            // Show all critical errors with full details
+            if (msg.critical || msg.message.includes('failed') || msg.message.includes('not set')) {
+              addTranscript(msg.message, 'error');
+              setStatus('Connection Error', false);
+              console.error('[VoiceAI Error]', msg.message);
+            } else if (msg.message.includes('connect') || msg.message.includes('API')) {
+              addTranscript('⚠️ ' + msg.message, 'error');
+              console.warn('[VoiceAI Warning]', msg.message);
+            }
+          }
+        } catch {
+          // ignore
+        }
+      } else {
+        // binary audio chunk (mp3) from server
+        if (evt.data && evt.data.byteLength > 0) {
+          audioQueue.push(evt.data);  // push ArrayBuffer directly
+          if (audioQueue.length === 1) {
+            startVoiceAnimation();
+          }
+          maybePlay();
+        }
+      }
+    };
+
+    ws.onclose = () => {
+      setStatus('Call Ended', false);
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      testBtn.disabled = true;
+      stopVoiceAnimation();
+      stopMic();
+      // Clear audio state
+      audioQueue = [];
+      playing = false;
+    };
+
+    ws.onerror = (e) => {
+      const errMsg = 'WebSocket connection error - check console for details';
+      addTranscript(errMsg, 'error');
+      console.error('[VoiceAI WebSocket Error]', e);
+    };
+  }
+
+  async function startMic() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: { 
+          channelCount: 1, 
+          sampleRate: 48000 
+        } 
+      });
+      // Use MediaRecorder with opus chunks @ 48k
+      mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus", audioBitsPerSecond: 128000 });
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {
+          e.data.arrayBuffer().then(buf => ws.send(buf));
+        }
+      };
+      mediaRecorder.start(100); // smaller timeslices so DG sees activity quickly
+      setStatus('Listening...', true);
+    } catch (err) {
+      addTranscript('Microphone access denied. Please allow microphone access and try again.', 'error');
+      setStatus('Mic Access Denied', false);
+      console.error('[VoiceAI Mic Error]', err);
+    }
+  }
+
+  function stopMic() {
+    try {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+      }
+    } catch {}
+    mediaRecorder = null;
+  }
+
+  function stopAll() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "end" }));
+      ws.close();
+    }
+    stopMic();
+    // Clear audio queue to prevent stale audio
+    audioQueue = [];
+    playing = false;
+  }
+
+  // Simple sequential MP3 playback by stitching chunks into one Blob every few chunks.
+  async function maybePlay() {
+    if (playing || audioQueue.length === 0) return;
+    
+    // Wait for at least a few chunks before trying to play
+    if (audioQueue.length < 3) return;
+    
+    playing = true;
+    
+    try {
+      // Merge up to N chunks at a time for smoother playback
+      const take = Math.min(audioQueue.length, 12);
+      const part = audioQueue.splice(0, take);
+      
+      // Create blob from ArrayBuffers
+      const blob = new Blob(part, { type: 'audio/mpeg' });
+      
+      // Check if blob has data
+      if (blob.size === 0) {
+        playing = false;
+        return;
+      }
+      
+      const url = URL.createObjectURL(blob);
+      audioEl.src = url;
+      
+      // Set up event handlers before playing
+      audioEl.onended = () => {
+        URL.revokeObjectURL(url);
+        playing = false;
+        // Stop animation if no more audio in queue
+        if (audioQueue.length === 0) {
+          stopVoiceAnimation();
+        }
+        maybePlay();
+      };
+      
+      audioEl.onerror = (e) => {
+        URL.revokeObjectURL(url);
+        playing = false;
+        maybePlay(); // try next chunk
+      };
+      
+      // Slight delay helps some browsers attach the buffer
+      await new Promise(r => setTimeout(r, 50));
+      await audioEl.play();
+      
+    } catch (e) {
+      playing = false;
+      // Try again with next chunks
+      setTimeout(() => maybePlay(), 100);
+    }
+  }
+
+  startBtn.addEventListener('click', start);
+  stopBtn.addEventListener('click', stopAll);
+  testBtn.addEventListener('click', () => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "say", text: "Testing voice output. You should hear me now." }));
+    }
+  });
+</script>
+</body>
+</html>
+

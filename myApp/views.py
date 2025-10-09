@@ -81,3 +81,7 @@ def dev_client(request):
     return render(request, "dev_client.html", {
         "WS_URL": getattr(settings, "DEV_PUBLIC_WS_URL", "ws://localhost:8080/ws/twilio")
     })
+
+def voice_ai_speaking(request):
+    """Serve the simplified voice AI speaking interface."""
+    return render(request, "talking_ai/speaking.html")
