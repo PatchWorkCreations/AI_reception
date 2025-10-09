@@ -95,8 +95,6 @@ async def send_silence(ws_send_pcm, ms: int):
         pass
 
 # --------- ElevenLabs TTS (ulaw_8000) with cache ---------
-from functools import lru_cache
-
 @lru_cache(maxsize=256)
 def _tts_key(text: str) -> str:
     return (text or "").strip().lower()
@@ -222,7 +220,6 @@ async def deepgram_stream(pcm_iter):
                 now = time.time()
                 if not (is_final or (now - last_emit) > 0.2): continue
                 if not is_final and txt == last_sent: continue
-                # Debug: print(f"ASR{'(final)' if is_final else ''} ▶ {txt}")
                 yield (txt, is_final)
                 last_emit = now; last_sent = txt
         finally:
@@ -371,9 +368,9 @@ async def handle_twilio(ws):
     # timers & activity tracking
     first_media = asyncio.Event()
     reprompt_task: asyncio.Task | None = None
-    last_heard_ts = 0.0          # last time we heard ANY caller audio (interim or final)
-    last_tts_end_ts = 0.0        # when our last TTS finished sending
-    REPROMPT_INTERVALS = [15.0, 30.0, 45.0]  # polite exponential nudges
+    last_heard_ts = time.time()    # start “silence” clock at NOW (prevents instant nudges)
+    last_tts_end_ts = time.time()
+    REPROMPT_INTERVALS = [15.0, 30.0, 45.0]  # set [] to disable, or [25.0] for single nudge
     reprompt_idx = 0
 
     # email capture
@@ -410,7 +407,7 @@ async def handle_twilio(ws):
 
     # ---- Speaking (serialized; calm) ----
     async def speak(text: str, label: str = "tts"):
-        nonlocal speak_task, barge_grace_until, last_tts_end_ts
+        nonlocal speak_task, barge_grace_until, last_tts_end_ts, last_heard_ts
         t = (text or "").strip()
         if not t or stopped_flag: return
         async with speak_lock:
@@ -431,9 +428,12 @@ async def handle_twilio(ws):
                 post = 50 + int(random.uniform(-10, 15))
                 await send_silence(send_pcm, max(post, 20))
             finally:
+                # We just talked → reset both clocks so nudges count from end of our speech
                 last_tts_end_ts = time.time()
+                if label in {"ask","ask-reprompt"}:
+                    last_heard_ts = last_tts_end_ts  # restart silence window after each ask
 
-    # ---- Calm reprompt loop (no stacking) ----
+    # ---- Calm reprompt loop (no stacking, gated by dual-silence) ----
     def start_reprompt_loop():
         nonlocal reprompt_task, reprompt_idx
         reprompt_idx = 0
@@ -446,15 +446,19 @@ async def handle_twilio(ws):
                     await asyncio.sleep(1.0)
                     now = time.time()
 
-                    # must be silent long enough, and we must not be speaking
-                    target_silence = REPROMPT_INTERVALS[reprompt_idx]
-                    long_enough = (now - last_heard_ts) >= target_silence
-                    not_speaking = (now - last_tts_end_ts) > 0.25 and (not speak_lock.locked())
+                    if not REPROMPT_INTERVALS:
+                        break
 
-                    if long_enough and not_speaking:
+                    target_silence = REPROMPT_INTERVALS[reprompt_idx]
+                    # Must be quiet since caller last noise AND since our last TTS
+                    quiet_since_caller = (now - last_heard_ts) >= target_silence
+                    quiet_since_us     = (now - last_tts_end_ts) >= target_silence
+                    not_speaking       = (not speak_lock.locked())
+
+                    if quiet_since_caller and quiet_since_us and not_speaking:
                         await speak("What’s the best email to reach you?", label="ask-reprompt")
                         reprompt_idx += 1
-                        # brief cushion before re-evaluating
+                        # after speaking we reset clocks inside speak(); add tiny cushion
                         await asyncio.sleep(0.5)
                 # exit quietly
             except asyncio.CancelledError:
@@ -467,16 +471,15 @@ async def handle_twilio(ws):
         nonlocal state, awaiting_email, email_buffer, done_flag
         awaiting_email = False
         email_buffer = ""
+        cancel_task(reprompt_task)
         await speak(CONFIRM_EMAIL.format(email=captured_email), label="confirm")
         await speak(GOODBYE, label="goodbye")
         state = STATE_ENDED
         done_flag = True
-        cancel_task(reprompt_task)
 
     # ---- User handling (email-only) ----
     async def handle_user(text: str):
         nonlocal state, awaiting_email, email_buffer
-        # email flow only
         if state == STATE_AWAITING_EMAIL:
             if text:
                 email_buffer = (email_buffer + " " + text).strip()[-300:]
@@ -517,6 +520,8 @@ async def handle_twilio(ws):
             if isinstance(item, tuple) and item[0] == "__EVENT__":
                 ev = item[1]
                 if ev == "SpeechStarted":
+                    # any caller activity resets silence
+                    nonlocal last_heard_ts
                     last_heard_ts = time.time()
                     # barge-in immediately (reprompts have no grace; intro has 0.9s)
                     if time.time() >= barge_grace_until:
@@ -565,9 +570,13 @@ async def handle_twilio(ws):
                 await speak(ASK_EMAIL, label="ask")
                 state = STATE_AWAITING_EMAIL
                 awaiting_email = True
+
+                # Reset silence windows AFTER the ask finished so timers start from now
+                now = time.time()
+                last_tts_end_ts = now
+                last_heard_ts   = now
+
                 # calm reprompts begin only after initial ask
-                last_tts_end_ts = time.time()
-                last_heard_ts = time.time()  # reset silence window post-ask
                 start_reprompt_loop()
 
             elif ev == "media":
