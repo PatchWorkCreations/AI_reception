@@ -1,7 +1,6 @@
 import os, json, base64, asyncio, websockets, httpx, re, time, random
 from dotenv import load_dotenv
 from functools import lru_cache
-from difflib import SequenceMatcher
 
 load_dotenv()
 
@@ -13,7 +12,7 @@ HTTP_ORIGIN    = os.getenv("PUBLIC_HTTP_ORIGIN", "http://localhost:8000")
 PORT           = int(os.getenv("PORT", "8080"))
 
 ECHO_BACK      = os.getenv("ECHO_BACK", "0") == "1"
-ELEVEN_VOICE   = os.getenv("ELEVENLABS_VOICE_ID", "Bella")  # Prefer real voice ID
+ELEVEN_VOICE   = os.getenv("ELEVENLABS_VOICE_ID", "Bella")  # Prefer real voice UUID
 
 # OpenAI model + timeouts (fast + cheap)
 OPENAI_MODEL         = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -72,7 +71,10 @@ INTRO = (
 
 ASK_EMAIL = "Would you like that sent to your email? If so, what’s the best email to reach you?"
 CONFIRM_EMAIL = "Got it. We'll email you at {email}."
-GOODBYE = f"Thank you! You can upload a medical file anytime at {DOMAIN_SPOKEN}. Choose your tone and get your summary within minutes."
+GOODBYE = (
+    f"Thank you! You can upload a medical file anytime at {DOMAIN_SPOKEN}. "
+    "Choose your preferred tone and get your summary within minutes."
+)
 
 # --------- Helpers (audio + utils) ---------
 def b64_to_bytes(s: str) -> bytes:
@@ -93,6 +95,8 @@ async def send_silence(ws_send_pcm, ms: int):
         pass
 
 # --------- ElevenLabs TTS (ulaw_8000) with cache ---------
+from functools import lru_cache
+
 @lru_cache(maxsize=256)
 def _tts_key(text: str) -> str:
     return (text or "").strip().lower()
@@ -218,7 +222,7 @@ async def deepgram_stream(pcm_iter):
                 now = time.time()
                 if not (is_final or (now - last_emit) > 0.2): continue
                 if not is_final and txt == last_sent: continue
-                print(f"ASR{'(final)' if is_final else ''} ▶ {txt}")
+                # Debug: print(f"ASR{'(final)' if is_final else ''} ▶ {txt}")
                 yield (txt, is_final)
                 last_emit = now; last_sent = txt
         finally:
@@ -226,6 +230,7 @@ async def deepgram_stream(pcm_iter):
 
 # --------- Email parsing ---------
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
 _NUMBER_WORDS = {
     "zero":"0","oh":"0","one":"1","two":"2","three":"3","four":"4","for":"4","five":"5",
     "six":"6","seven":"7","eight":"8","nine":"9","ten":"10","eleven":"11","twelve":"12",
@@ -333,7 +338,7 @@ async def call_openai_email(text: str) -> str | None:
         content = (data.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
         obj = json.loads(content or "{}")
         email = obj.get("email")
-        if isinstance(email, str) and EMAIL_RE.fullmatch(email): 
+        if isinstance(email, str) and EMAIL_RE.fullmatch(email):
             _cache_set(key, {"email": email})
             return email
         return None
@@ -341,7 +346,7 @@ async def call_openai_email(text: str) -> str | None:
         print("OPENAI EXC ▶", repr(e))
         return None
 
-# --------- Twilio WS Server (email-only FSM) ---------
+# --------- Twilio WS Server (email-only FSM with calm reprompts) ---------
 STATE_IDLE            = "IDLE"            # play intro + ask email
 STATE_AWAITING_EMAIL  = "AWAITING_EMAIL"  # waiting for email
 STATE_ENDED           = "ENDED"
@@ -357,17 +362,19 @@ async def handle_twilio(ws):
 
     # --- Session state ---
     state = STATE_IDLE
-    last_user_ts = 0.0
 
     # voice/queue controls
     speak_task: asyncio.Task | None = None
     speak_lock = asyncio.Lock()
     barge_grace_until = 0.0
 
-    # timers
+    # timers & activity tracking
     first_media = asyncio.Event()
-    idle_timer_task: asyncio.Task | None = None
-    email_timeout_task: asyncio.Task | None = None
+    reprompt_task: asyncio.Task | None = None
+    last_heard_ts = 0.0          # last time we heard ANY caller audio (interim or final)
+    last_tts_end_ts = 0.0        # when our last TTS finished sending
+    REPROMPT_INTERVALS = [15.0, 30.0, 45.0]  # polite exponential nudges
+    reprompt_idx = 0
 
     # email capture
     awaiting_email = False
@@ -401,15 +408,19 @@ async def handle_twilio(ws):
         if t and not t.done():
             t.cancel()
 
-    # ---- Speaking (serialized) ----
+    # ---- Speaking (serialized; calm) ----
     async def speak(text: str, label: str = "tts"):
-        nonlocal speak_task, barge_grace_until
+        nonlocal speak_task, barge_grace_until, last_tts_end_ts
         t = (text or "").strip()
         if not t or stopped_flag: return
         async with speak_lock:
             cancel_task(speak_task)
-            if label.startswith("answer") or label in {"intro","ask","confirm","goodbye"}:
+            # Allow barge-in for reprompts; small grace only for intro/ask/confirm/goodbye
+            if label in {"intro","confirm","goodbye","ask"}:
                 barge_grace_until = time.time() + 0.9
+            else:
+                barge_grace_until = 0.0  # reprompts: cut-through allowed
+
             print(f"SAY ▶ {label}")
             try:
                 pre = 50 + int(random.uniform(-10, 15))
@@ -420,21 +431,36 @@ async def handle_twilio(ws):
                 post = 50 + int(random.uniform(-10, 15))
                 await send_silence(send_pcm, max(post, 20))
             finally:
-                pass
+                last_tts_end_ts = time.time()
 
-    # ---- Email reprompt timer ----
-    def start_email_timeout(seconds: float = 12.0):
-        nonlocal email_timeout_task
-        cancel_task(email_timeout_task)
-        async def _wait():
+    # ---- Calm reprompt loop (no stacking) ----
+    def start_reprompt_loop():
+        nonlocal reprompt_task, reprompt_idx
+        reprompt_idx = 0
+        cancel_task(reprompt_task)
+
+        async def _loop():
+            nonlocal reprompt_idx
             try:
-                await asyncio.sleep(seconds)
-                if not (stopped_flag or done_flag) and state == STATE_AWAITING_EMAIL:
-                    await speak("What’s the best email to reach you?", label="ask-reprompt")
-                    start_email_timeout(seconds)
+                while not stopped_flag and not done_flag and state == STATE_AWAITING_EMAIL and reprompt_idx < len(REPROMPT_INTERVALS):
+                    await asyncio.sleep(1.0)
+                    now = time.time()
+
+                    # must be silent long enough, and we must not be speaking
+                    target_silence = REPROMPT_INTERVALS[reprompt_idx]
+                    long_enough = (now - last_heard_ts) >= target_silence
+                    not_speaking = (now - last_tts_end_ts) > 0.25 and (not speak_lock.locked())
+
+                    if long_enough and not_speaking:
+                        await speak("What’s the best email to reach you?", label="ask-reprompt")
+                        reprompt_idx += 1
+                        # brief cushion before re-evaluating
+                        await asyncio.sleep(0.5)
+                # exit quietly
             except asyncio.CancelledError:
                 return
-        email_timeout_task = asyncio.create_task(_wait())
+
+        reprompt_task = asyncio.create_task(_loop())
 
     # ---- Confirm + Goodbye ----
     async def confirm_and_end(captured_email: str):
@@ -445,26 +471,24 @@ async def handle_twilio(ws):
         await speak(GOODBYE, label="goodbye")
         state = STATE_ENDED
         done_flag = True
-        cancel_task(email_timeout_task)
+        cancel_task(reprompt_task)
 
     # ---- User handling (email-only) ----
     async def handle_user(text: str):
-        nonlocal state, awaiting_email, email_buffer, last_user_ts
-        last_user_ts = time.time()
-
+        nonlocal state, awaiting_email, email_buffer
         # email flow only
         if state == STATE_AWAITING_EMAIL:
-            if text: 
+            if text:
                 email_buffer = (email_buffer + " " + text).strip()[-300:]
-            # try strict match
+            # strict match
             m = EMAIL_RE.search(text or "")
             if m:
                 await confirm_and_end(m.group(0)); return
-            # try normalizer
+            # spoken normalizer
             spoken = normalize_spoken_email(email_buffer)
             if spoken and EMAIL_RE.fullmatch(spoken):
                 await confirm_and_end(spoken); return
-            # try OpenAI micro-helper
+            # OpenAI micro-helper (optional)
             if OPENAI_ENABLE:
                 try:
                     em = await asyncio.wait_for(call_openai_email(email_buffer), timeout=OPENAI_TIMEOUT_S)
@@ -474,7 +498,7 @@ async def handle_twilio(ws):
                     pass
             return
 
-    # ---- Brain: ASR → handler with barge-in ----
+    # ---- Brain: ASR → handler with respectful barge-in ----
     async def brain():
         if not DEEPGRAM_KEY: return
         try:
@@ -488,17 +512,22 @@ async def handle_twilio(ws):
 
         async for item in deepgram_stream(pcm_iter):
             if stopped_flag: break
+
+            # Events (speech start/finish)
             if isinstance(item, tuple) and item[0] == "__EVENT__":
                 ev = item[1]
                 if ev == "SpeechStarted":
-                    # barge-in: cancel any ongoing TTS after grace
+                    last_heard_ts = time.time()
+                    # barge-in immediately (reprompts have no grace; intro has 0.9s)
                     if time.time() >= barge_grace_until:
                         cancel_task(speak_task)
                 continue
 
+            # Hypothesis
             utter, is_final = item
             if not utter: continue
             now = time.time()
+            last_heard_ts = now  # any hypothesis = caller activity
 
             if is_final:
                 if pending_final and (now - pending_ts) <= FINAL_DEBOUNCE and not re.search(r"[.!?…]\s*$", pending_final):
@@ -510,7 +539,6 @@ async def handle_twilio(ws):
 
                 if pending_final:
                     words = pending_final.split()
-                    normalized = pending_final.lower().strip()
                     has_punct = bool(re.search(r"[.!?…]\s*$", pending_final))
                     if has_punct or len(words) >= 2:
                         await handle_user(pending_final)
@@ -521,6 +549,7 @@ async def handle_twilio(ws):
 
     brain_task = asyncio.create_task(brain())
 
+    # ---- WebSocket loop ----
     try:
         async for raw in ws:
             data = json.loads(raw)
@@ -531,12 +560,15 @@ async def handle_twilio(ws):
                 stream_sid = start_info.get("streamSid")
                 print(f"WS ▶ start streamSid={stream_sid}")
 
-                # Intro + ask for email
+                # Intro + ask for email (one-shot)
                 await speak(INTRO, label="intro")
                 await speak(ASK_EMAIL, label="ask")
                 state = STATE_AWAITING_EMAIL
                 awaiting_email = True
-                start_email_timeout(12.0)
+                # calm reprompts begin only after initial ask
+                last_tts_end_ts = time.time()
+                last_heard_ts = time.time()  # reset silence window post-ask
+                start_reprompt_loop()
 
             elif ev == "media":
                 payload_b64 = data["media"]["payload"]
@@ -556,8 +588,7 @@ async def handle_twilio(ws):
                 print("WS ▶ stop")
                 stopped_flag = True
                 conn_open = False
-                cancel_task(idle_timer_task)
-                cancel_task(email_timeout_task)
+                cancel_task(reprompt_task)
                 cancel_task(speak_task)
                 break
 
