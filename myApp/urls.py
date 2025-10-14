@@ -1,6 +1,6 @@
 # myApp/urls.py
 from django.urls import path
-from .views import voice_answer, status_cb, call_me, ws_url_debug, voice_ai_speaking
+from .views import voice_answer, status_cb, call_me, ws_url_debug, voice_ai_speaking, serve_preroll_wav
 from . import views
 
 app_name = "twilio"
@@ -17,4 +17,7 @@ urlpatterns = [
 
     path('dev/', views.dev_client, name='dev_client'),
     path('voice-ai/', voice_ai_speaking, name='voice_ai_speaking'),
+    
+    # Serve pre-roll audio file
+    path('preroll-audio/', serve_preroll_wav, name='preroll_audio'),
 ]

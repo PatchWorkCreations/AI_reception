@@ -19,7 +19,7 @@ OPENAI_TIMEOUT_S     = float(os.getenv("OPENAI_TIMEOUT_S", "0.6"))
 OPENAI_ENABLE        = bool(OPENAI_API_KEY)
 
 # --------- Preroll audio (your WAV μ-law 8k) ---------
-PREROLL_WAV_URL = f"{HTTP_ORIGIN.rstrip('/')}/static/neuromed_intro_G711.org_.wav"
+PREROLL_WAV_URL = f"{HTTP_ORIGIN.rstrip('/')}/twilio/preroll-audio/"
 PREROLL_CHUNK_SIZE = 160  # 20ms at 8kHz μ-law (1 byte per sample)
 
 # --------- Shared HTTP client ---------

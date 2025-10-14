@@ -85,3 +85,21 @@ def dev_client(request):
 def voice_ai_speaking(request):
     """Serve the simplified voice AI speaking interface."""
     return render(request, "talking_ai/speaking.html")
+
+
+@csrf_exempt
+def serve_preroll_wav(request):
+    """Serve the pre-roll audio file for the voice bot."""
+    import os
+    from django.http import FileResponse
+    
+    # Path to the WAV file
+    wav_path = os.path.join(settings.BASE_DIR, 'myApp', 'static', 'neuromed_intro_G711.org_.wav')
+    
+    if not os.path.exists(wav_path):
+        return HttpResponse("WAV file not found", status=404)
+    
+    # Serve the file with appropriate content type
+    response = FileResponse(open(wav_path, 'rb'), content_type='audio/wav')
+    response['Content-Disposition'] = 'inline; filename="neuromed_intro_G711.org_.wav"'
+    return response

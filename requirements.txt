@@ -9,3 +9,4 @@ pydantic==2.8.2
 python-dotenv==1.0.1
 h2==4.1.0
 pydub==0.25.1
+whitenoise==6.6.0
