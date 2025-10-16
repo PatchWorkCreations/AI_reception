@@ -608,13 +608,8 @@ async def handle_twilio(ws):
                 # ▶▶ Play your μ-law WAV payload instead of TTS intro
                 await play_preroll_wav(send_pcm)
 
-                # Ask for email after WAV playback
-                await speak(ASK_EMAIL, label="ask")
-                state = STATE_AWAITING_EMAIL
-                now = time.time()
-                last_tts_end_ts = now
-                last_heard_ts   = now
-                start_reprompt_loop()
+                # WAV playback completed, call will continue until caller hangs up
+                print("WAV ▶ Playback completed, call ready for natural hangup")
 
             elif ev == "media":
                 payload_b64 = data["media"]["payload"]
