@@ -1,7 +1,6 @@
 import os, json, base64, asyncio, websockets, httpx, re, time, random, struct
 from dotenv import load_dotenv
 from functools import lru_cache
-from twilio.rest import Client
 
 load_dotenv()
 
@@ -11,10 +10,6 @@ DEEPGRAM_KEY   = os.getenv("DEEPGRAM_API_KEY")
 ELEVEN_KEY     = os.getenv("ELEVENLABS_API_KEY")
 HTTP_ORIGIN    = os.getenv("PUBLIC_HTTP_ORIGIN", "https://neuromed-django-production.up.railway.app")
 PORT           = int(os.getenv("PORT", "8080"))
-
-# Twilio credentials for call termination
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
 ECHO_BACK      = os.getenv("ECHO_BACK", "0") == "1"
 ELEVEN_VOICE   = os.getenv("ELEVENLABS_VOICE_ID", "Bella")
@@ -121,20 +116,6 @@ def extract_wav_ulaw_payload(wav_bytes: bytes) -> bytes:
         raise ValueError("WAV has no data chunk.")
     return data_payload
 
-async def end_twilio_call(call_sid: str):
-    """End a Twilio call by updating its status to completed"""
-    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not call_sid:
-        print("CALL END ▶ Missing Twilio credentials or call_sid")
-        return False
-    
-    try:
-        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        call = client.calls(call_sid).update(status='completed')
-        print(f"CALL END ▶ Call {call_sid} ended successfully")
-        return True
-    except Exception as e:
-        print(f"CALL END ERR ▶ Failed to end call {call_sid}: {repr(e)}")
-        return False
 
 async def play_preroll_wav(ws_send_pcm, url: str = PREROLL_WAV_URL):
     try:
@@ -625,30 +606,15 @@ async def handle_twilio(ws):
                 print(f"WS ▶ start streamSid={stream_sid} callSid={call_sid}")
 
                 # ▶▶ Play your μ-law WAV payload instead of TTS intro
-                wav_completed = await play_preroll_wav(send_pcm)
-                
-                # End the call after WAV recording is completely finished
-                if wav_completed and call_sid:
-                    print("WAV ▶ Playback completed, ending call...")
-                    await end_twilio_call(call_sid)
-                    # Close the websocket connection
-                    await ws.close(code=1000, reason="WAV playback completed")
-                    return
-                elif call_sid:
-                    # If WAV playback failed but we have call_sid, still end the call
-                    print("WAV ▶ Playback failed, but ending call anyway...")
-                    await end_twilio_call(call_sid)
-                    await ws.close(code=1000, reason="WAV playback failed, call ended")
-                    return
-                else:
-                    # Fallback: ask for email if no call_sid available
-                    print("WAV ▶ No call_sid available, falling back to email collection")
-                    await speak(ASK_EMAIL, label="ask")
-                    state = STATE_AWAITING_EMAIL
-                    now = time.time()
-                    last_tts_end_ts = now
-                    last_heard_ts   = now
-                    start_reprompt_loop()
+                await play_preroll_wav(send_pcm)
+
+                # Ask for email after WAV playback
+                await speak(ASK_EMAIL, label="ask")
+                state = STATE_AWAITING_EMAIL
+                now = time.time()
+                last_tts_end_ts = now
+                last_heard_ts   = now
+                start_reprompt_loop()
 
             elif ev == "media":
                 payload_b64 = data["media"]["payload"]
@@ -686,7 +652,6 @@ async def main():
     print("ENV ▶ HTTP_ORIGIN =", os.getenv("PUBLIC_HTTP_ORIGIN"))
     print("ENV ▶ ELEVEN key? ", "yes" if ELEVEN_KEY else "missing")
     print("ENV ▶ DEEPGRAM?   ", "yes" if DEEPGRAM_KEY else "missing")
-    print("ENV ▶ TWILIO?     ", "yes" if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN else "missing")
     print("ENV ▶ ECHO_BACK   =", ECHO_BACK)
     print("ENV ▶ ELEVEN_VOICE=", ELEVEN_VOICE)
     print("ENV ▶ OPENAI      =", "yes" if OPENAI_ENABLE else "disabled")
