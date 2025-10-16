@@ -138,19 +138,35 @@ async def end_twilio_call(call_sid: str):
 
 async def play_preroll_wav(ws_send_pcm, url: str = PREROLL_WAV_URL):
     try:
+        print(f"WAV ▶ Starting playback from {url}")
         r = await SHARED_CLIENT.get(url, timeout=httpx.Timeout(30.0))
         r.raise_for_status()
         ulaw_payload = extract_wav_ulaw_payload(r.content)
+        
+        total_chunks = len(ulaw_payload) // PREROLL_CHUNK_SIZE
+        estimated_duration = len(ulaw_payload) / 8000  # 8kHz = 8000 samples per second
+        print(f"WAV ▶ Total size: {len(ulaw_payload)} bytes, ~{total_chunks} chunks, ~{estimated_duration:.1f}s duration")
+        
         # stream in ~20ms frames
+        chunk_count = 0
         for j in range(0, len(ulaw_payload), PREROLL_CHUNK_SIZE):
             piece = ulaw_payload[j:j+PREROLL_CHUNK_SIZE]
             ok = await ws_send_pcm(piece)
             if not ok:
+                print(f"WAV ▶ Send failed at chunk {chunk_count}")
                 return False
+            chunk_count += 1
             await asyncio.sleep(0)  # yield
+            
+            # Log progress every 5 seconds (250 chunks * 20ms = 5s)
+            if chunk_count % 250 == 0:
+                elapsed = chunk_count * 0.02  # 20ms per chunk
+                print(f"WAV ▶ Progress: {chunk_count}/{total_chunks} chunks ({elapsed:.1f}s elapsed)")
+        
+        print(f"WAV ▶ Playback completed successfully ({chunk_count} chunks sent)")
         return True  # WAV playback completed successfully
     except Exception as e:
-        print("PREROLL ERR ▶", repr(e))
+        print("WAV ERR ▶", repr(e))
         return False
 
 # --------- ElevenLabs TTS (ulaw_8000) with cache ---------
@@ -611,21 +627,28 @@ async def handle_twilio(ws):
                 # ▶▶ Play your μ-law WAV payload instead of TTS intro
                 wav_completed = await play_preroll_wav(send_pcm)
                 
-                # End the call immediately after WAV recording ends
+                # End the call after WAV recording is completely finished
                 if wav_completed and call_sid:
                     print("WAV ▶ Playback completed, ending call...")
                     await end_twilio_call(call_sid)
                     # Close the websocket connection
                     await ws.close(code=1000, reason="WAV playback completed")
                     return
-
-                # Ask for email (this code will only run if WAV playback failed or call_sid is missing)
-                await speak(ASK_EMAIL, label="ask")
-                state = STATE_AWAITING_EMAIL
-                now = time.time()
-                last_tts_end_ts = now
-                last_heard_ts   = now
-                start_reprompt_loop()
+                elif call_sid:
+                    # If WAV playback failed but we have call_sid, still end the call
+                    print("WAV ▶ Playback failed, but ending call anyway...")
+                    await end_twilio_call(call_sid)
+                    await ws.close(code=1000, reason="WAV playback failed, call ended")
+                    return
+                else:
+                    # Fallback: ask for email if no call_sid available
+                    print("WAV ▶ No call_sid available, falling back to email collection")
+                    await speak(ASK_EMAIL, label="ask")
+                    state = STATE_AWAITING_EMAIL
+                    now = time.time()
+                    last_tts_end_ts = now
+                    last_heard_ts   = now
+                    start_reprompt_loop()
 
             elif ev == "media":
                 payload_b64 = data["media"]["payload"]
