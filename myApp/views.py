@@ -94,12 +94,12 @@ def serve_preroll_wav(request):
     from django.http import FileResponse
     
     # Path to the WAV file
-    wav_path = os.path.join(settings.BASE_DIR, 'myApp', 'static', 'neuromed_reception_G711.org_.wav')
+    wav_path = os.path.join(settings.BASE_DIR, 'myApp', 'static', '12_G711.org_.wav')
     
     if not os.path.exists(wav_path):
         return HttpResponse("WAV file not found", status=404)
     
     # Serve the file with appropriate content type
     response = FileResponse(open(wav_path, 'rb'), content_type='audio/wav')
-    response['Content-Disposition'] = 'inline; filename="neuromed_reception_G711.org_.wav"'
+    response['Content-Disposition'] = 'inline; filename="12_G711.org_.wav"'
     return response
